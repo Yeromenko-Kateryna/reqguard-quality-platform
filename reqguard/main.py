@@ -1,8 +1,10 @@
 from typing import Literal
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
+
+from reqguard.persistence import PersistenceUnavailable, save_analysis
 
 
 class AnalysisRequest(BaseModel):
@@ -77,7 +79,17 @@ app = FastAPI(title="ReqGuard", version="0.1.0")
 
 @app.post("/analyses", response_model=CompletedResponse | UnsupportedResponse)
 def create_analysis(request: AnalysisRequest) -> CompletedResponse | UnsupportedResponse:
+    response = analyze(request.requirement_text)
+    try:
+        save_analysis(request.requirement_text, response.model_dump(mode="json"))
+    except PersistenceUnavailable:
+        raise HTTPException(status_code=503, detail="Persistence unavailable") from None
+    return response
+
+
+def analyze(original_input: str) -> CompletedResponse | UnsupportedResponse:
+    """Compute the accepted deterministic result before persisting it."""
     run_id = uuid4()
-    if request.requirement_text != FIXTURE_TEXT:
+    if original_input != FIXTURE_TEXT:
         return UnsupportedResponse(run_id=run_id)
     return CompletedResponse(run_id=run_id, analysis=fake_analysis())

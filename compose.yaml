@@ -1,0 +1,31 @@
+name: reqguard_rg04_v11
+services:
+  db:
+    image: postgres:17.11-bookworm
+    environment:
+      POSTGRES_DB: reqguard
+      POSTGRES_USER: reqguard
+      POSTGRES_PASSWORD: local_only_reqguard
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - type: volume
+        source: rg04_pgdata
+        target: /var/lib/postgresql/data
+      - type: bind
+        source: ./db/001_init.sql
+        target: /schema/001_init.sql
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U reqguard -d reqguard]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+volumes:
+  rg04_pgdata:
+    name: reqguard_rg04_v11_pgdata_20261008
+    labels:
+      org.reqguard.scope: rg04-v1.1-local-test
+      org.reqguard.owner: reqguard-quality-platform

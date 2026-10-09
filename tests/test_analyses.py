@@ -10,6 +10,11 @@ client = TestClient(app)
 EXAMPLE = "The user can quickly reset their password"
 
 
+@pytest.fixture(autouse=True)
+def repository_stub(monkeypatch):
+    monkeypatch.setattr("reqguard.main.save_analysis", lambda original_input, result: None)
+
+
 def post(text):
     return client.post("/analyses", json={"requirement_text": text})
 
