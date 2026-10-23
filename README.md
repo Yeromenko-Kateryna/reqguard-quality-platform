@@ -117,3 +117,7 @@ are recorded in the matrix. Protected-build acceptance and operational Win32
 security remain **OPEN**; the RG-05 lifecycle is not complete. B-01–B-10
 dispositions remain unchanged. These historical results do not establish current
 CI status or semantic AI quality.
+
+For a future, separately authorized fresh-checkout run, see the
+[supplementary L1–L3 runbook](docs/rg05/SUPPLEMENTARY_REPRODUCTION.md).
+The runner is review material; adding it does not authorize native execution.

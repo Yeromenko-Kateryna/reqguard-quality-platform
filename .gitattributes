@@ -1,0 +1,4 @@
+# Preserve the exact bytes of the accepted RG-05 source inputs on checkout.
+/quality/api/scripts/rg05-v2-win32.cc text eol=lf
+/quality/api/scripts/build-rg05-v2-win32.ps1 text eol=lf
+/quality/api/tests/rg05-v2-win32-negative.test.ts text eol=lf

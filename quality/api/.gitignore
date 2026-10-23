@@ -1,0 +1,30 @@
+node_modules/
+.runtime/
+test-results/
+playwright-report/
+*.local
+# Supplementary native artifacts and local diagnostics are never source inputs.
+*.node
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.bin
+*.log
+*.tmp
+*.temp
+.env
+.env.*
+credentials*
+l1-result.json
+l2-result.json
+l3-result.json
+# Accidental root-level receipt copies; do not hide nested source fixtures.
+/result.json
+/process.json
+/launch.jsonl
+l3-test-snapshot/
+rg05-synthetic-build-*/
