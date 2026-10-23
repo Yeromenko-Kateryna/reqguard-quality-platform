@@ -106,3 +106,14 @@ and terminates its own server. Docker resources remain available for inspection.
 The existing Starlette/httpx deprecation warning remains visible. This is authored
 fake-provider behavior, with no live AI calls or semantic quality evidence. UI,
 Playwright, CI, authentication and production deployment are outside this slice.
+
+## RG-05 supplementary synthetic validation
+
+The [RG-05 closure matrix](docs/rg05/RG-05-V2.1_B01-B10_CLOSURE_MATRIX.md)
+records accepted L1–L3 supplementary synthetic evidence: an interactive MSVC
+syntax/type check (exit `0`, no separately preserved log), native compilation and
+linking, and 18/18 synthetic native tests. Evidence fingerprints and limitations
+are recorded in the matrix. Protected-build acceptance and operational Win32
+security remain **OPEN**; the RG-05 lifecycle is not complete. B-01–B-10
+dispositions remain unchanged. These historical results do not establish current
+CI status or semantic AI quality.
