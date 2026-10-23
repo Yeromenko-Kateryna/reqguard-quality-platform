@@ -1,7 +1,10 @@
+from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from reqguard.persistence import PersistenceUnavailable, save_analysis
@@ -75,6 +78,13 @@ def fake_analysis() -> Analysis:
 
 
 app = FastAPI(title="ReqGuard", version="0.1.0")
+UI_DIRECTORY = Path(__file__).with_name("static")
+app.mount("/static", StaticFiles(directory=UI_DIRECTORY), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def product_page() -> FileResponse:
+    return FileResponse(UI_DIRECTORY / "index.html", media_type="text/html")
 
 
 @app.post("/analyses", response_model=CompletedResponse | UnsupportedResponse)

@@ -79,16 +79,46 @@ response. There are no automatic retries. A failed COMMIT acknowledgement may
 leave an uncertain outcome; HTTP 503 does not prove row absence. Unexpected
 application errors retain HTTP 500 semantics.
 
+## Minimal product UI
+
+With PostgreSQL/schema and DATABASE_URL configured as above, start the same
+Uvicorn command and open http://127.0.0.1:8000/. No frontend build, CDN or runtime
+JavaScript packages are required. JavaScript must be enabled in the browser.
+
+Submit the prefilled exact fixture to see run_id, provider, completed status,
+ambiguities, missing measurable criteria and candidate tests. Other valid text
+shows unsupported_fixture with no analysis. Blank/invalid input displays the
+API's HTTP 422 details. Loading prevents duplicate submissions and clears old
+results; HTTP/network failures never display success or automatically retry.
+A network failure may occur after the server committed: check before resubmitting.
+API-provided text is rendered as text nodes, never interpreted as HTML.
+
+The page makes a same-origin JSON POST to the existing /analyses endpoint.
+Database transactions, schema, response contracts and fake-provider behavior are
+unchanged. The UI demonstrates authored fixture behavior, not live AI quality.
+
 ## Verification
 
 ```powershell
 uv run --locked pytest -q tests/test_analyses.py
 uv run --locked pytest -q tests/test_persistence_unit.py
+uv run --locked pytest -q tests/test_ui.py
 uv run --locked pytest -q tests/test_postgres_integration.py
 uv run --locked pytest -q tests/test_postgres_integration.py
 uv run --locked pytest -q
 uv run --locked python scripts/rg04_network_sql_smoke.py
 ```
+
+Frontend request/state/rendering checks use Node's built-in test runner (Node
+24.15.0 reference; no npm install or RG-05 orchestration needed):
+
+```powershell
+node --test tests/ui.test.mjs
+```
+
+UI HTTP tests replace persistence with a test stub; frontend tests use a small
+DOM adapter, not a browser engine. They do not establish PostgreSQL persistence
+or browser end-to-end coverage. Browser and CI acceptance remain separate work.
 
 Baseline tests use a repository stub. Unit tests verify mapping, validation,
 parameter binding, transaction completion and sanitized failures. They do not
@@ -104,8 +134,9 @@ subprocess in the DB container. It prints SQL evidence, deletes only its own UUI
 and terminates its own server. Docker resources remain available for inspection.
 
 The existing Starlette/httpx deprecation warning remains visible. This is authored
-fake-provider behavior, with no live AI calls or semantic quality evidence. UI,
-Playwright, CI, authentication and production deployment are outside this slice.
+fake-provider behavior, with no live AI calls or semantic quality evidence.
+Independent Playwright UI/API-to-SQL, CI, authentication and production deployment
+are outside this slice.
 
 ## RG-05 supplementary synthetic validation
 

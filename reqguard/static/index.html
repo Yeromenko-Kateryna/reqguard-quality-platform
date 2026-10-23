@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ReqGuard — Requirement check</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="module" src="/static/app.mjs"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="brand">ReqGuard <span>Quality Platform</span></p>
+      <p class="badge">Deterministic fake provider</p>
+      <h1>Make a requirement<br>easier to test.</h1>
+      <p class="intro">Explore an authored example of ambiguities, missing criteria and candidate tests. This demo does not use a live AI model.</p>
+    </header>
+    <section class="card" aria-labelledby="input-heading">
+      <h2 id="input-heading">Check a requirement</h2>
+      <form id="analysis-form" novalidate>
+        <label for="requirement">Requirement text</label>
+        <textarea id="requirement" name="requirement_text" rows="5" aria-describedby="input-help">The user can quickly reset their password</textarea>
+        <p id="input-help" class="muted">1–2000 characters, including non-whitespace text. The example above is the supported fixture; other valid text returns unsupported_fixture.</p>
+        <button id="submit" type="submit" disabled>Submit requirement</button>
+      </form>
+      <noscript><p>JavaScript must be enabled to submit a requirement.</p></noscript>
+      <p id="notice" role="status" aria-live="polite">Ready to check the example.</p>
+      <section id="error" class="error" role="alert" hidden>
+        <h3 id="error-title"></h3>
+        <p id="error-message"></p>
+        <ul id="error-details"></ul>
+      </section>
+    </section>
+    <section id="result" class="card" aria-labelledby="result-heading" hidden>
+      <h2 id="result-heading">Result</h2>
+      <p id="result-summary"></p>
+      <dl class="metadata">
+        <div><dt>Run ID</dt><dd id="run-id"></dd></div>
+        <div><dt>Status</dt><dd id="status"></dd></div>
+        <div><dt>Provider</dt><dd id="provider"></dd></div>
+      </dl>
+      <div id="analysis"></div>
+    </section>
+    <footer>Authored fixture results demonstrate the workflow, not semantic AI quality.</footer>
+  </main>
+</body>
+</html>
