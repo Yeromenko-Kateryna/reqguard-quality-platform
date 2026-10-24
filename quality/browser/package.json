@@ -1,0 +1,9 @@
+{
+  "name": "reqguard-rg06b-browser",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "24.15.0", "npm": "11.12.1" },
+  "scripts": { "test": "playwright test --project=chromium" },
+  "devDependencies": { "@playwright/test": "1.64.0", "pg": "8.23.1" }
+}

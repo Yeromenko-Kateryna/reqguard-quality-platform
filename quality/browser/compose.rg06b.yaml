@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:17.11-bookworm
+    restart: "no"
+    environment:
+      POSTGRES_DB: reqguard_rg06b
+      POSTGRES_USER: reqguard_rg06b
+      POSTGRES_PASSWORD: ${RG06B_PASSWORD:?launcher-generated credential required}
+    ports:
+      - "127.0.0.1:${RG06B_DB_PORT:?launcher-selected port required}:5432"
+    labels:
+      org.reqguard.scope: rg06b-e2e
+      org.reqguard.run: ${RG06B_RUN_ID:?launcher run required}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - type: bind
+        source: ../../db/001_init.sql
+        target: /schema/001_init.sql
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reqguard_rg06b -d reqguard_rg06b"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  pgdata:
+    labels:
+      org.reqguard.scope: rg06b-e2e
+      org.reqguard.run: ${RG06B_RUN_ID:?launcher run required}
+networks:
+  default:
+    labels:
+      org.reqguard.scope: rg06b-e2e
+      org.reqguard.run: ${RG06B_RUN_ID:?launcher run required}
