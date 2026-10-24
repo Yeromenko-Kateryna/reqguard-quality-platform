@@ -138,6 +138,85 @@ fake-provider behavior, with no live AI calls or semantic quality evidence.
 Independent Playwright UI/API-to-SQL, CI, authentication and production deployment
 are outside this slice.
 
+## RG-06D Linux CI (implementation only; CI NOT RUN)
+
+`.github/workflows/rg06d-e2e.yml` defines one GitHub-hosted Ubuntu 24.04 job for
+pull requests, pushes to `main`, and manual dispatch. No workflow has been executed
+as evidence for this implementation. Local RG-06B results are not CI results.
+The Windows launcher, its guards, both browser specs and existing config are unchanged.
+
+The workflow pins checkout v7.0.1, setup-node v7.1.0, setup-uv v10.3.2 and
+upload-artifact v6.0.0 by full commit SHA. It installs Python 3.12.10, uv 0.11.22,
+Node 24.15.0 and npm 11.12.1. `uv sync --locked --python 3.12.10 --no-dev` and
+`npm --prefix quality/browser ci --include=dev` use the existing locks. Installed
+Playwright/test/core must be 1.64.0 and pg 8.23.1. The local CLI installs Chromium
+1248 with `--with-deps --no-shell`; no browser cache is restored. Browser files
+live under the job's explicit `RUNNER_TEMP` cache. Ubuntu and apt packages remain
+moving infrastructure, so these pins do not promise identical OS bytes.
+
+PostgreSQL is a fresh GitHub service, with no host data mounts or adopted database.
+The linux/amd64 `postgres:17.11-bookworm` manifest is pinned to
+`sha256:ec4dfc6571f04fe0731ce948c1500d676af49a7224392dcc6995cc1ee33a94bb`,
+verified on 2026-10-24 against the official
+[docker-library image metadata](https://github.com/docker-library/repo-info/blob/master/repos/postgres/remote/17.11-bookworm.md).
+Direct Registry/Hub verification was unavailable due to TLS verification failures;
+no certificates were bypassed and no image was pulled during implementation.
+The workflow uses a public synthetic 64-hex service password, not repository secrets.
+The mapped database port is supplied by GitHub; application/SQL clients use loopback.
+`pg_isready` is followed by a separate psycopg identity/version connection, a check
+that the analyses table does not exist, committed initialization from
+`db/001_init.sql`, and an empty-table assertion. The specs retain their full
+schema, sentinel, HTTP/UI, independent SQL and targeted cleanup assertions.
+
+`scripts/run_rg06d_ci.py prepare` creates run metadata before dependency setup.
+`run` requires the prepared GitHub Linux context and exact runtime versions. It
+populates the existing `RG06B_RUN_ID`, `RG06B_ARTIFACT`, `RG06B_DB_PORT`,
+`RG06B_API_PORT`, `RG06B_BASE_URL`, `RG06B_PASSWORD` and `DATABASE_URL` contract.
+The launch metadata identifies Linux CI and records checkout HEAD, GitHub run/attempt,
+image pin and source hashes. `playwright.ci.config.ts` inherits all existing
+settings and disables only Playwright's webServer, because this runner owns Uvicorn.
+
+One Uvicorn worker must return HTTP 200 within 60 seconds while its owned process
+remains alive. Playwright runs once, serially, without retries, with the original
+120-second global timeout and a 160-second outer wait. Server shutdown uses SIGTERM
+and a 10-second wait; escalation to SIGKILL or unknown termination fails CI.
+Graceful Uvicorn termination requires exit 0 or handled SIGTERM plus shutdown log
+markers. Linux subreaper adoption and wait receipts must confirm no surviving
+descendants. These are Linux receipts, not Windows Job Object receipts.
+Exactly two passing Chromium results, zero failures/skips/flaky/retries, exact
+`CLEANED` SQL receipt and verified process shutdown are all necessary for success.
+
+Application/process cleanup is verified by the harness. PostgreSQL service disposal
+is GitHub-managed after the job and is explicitly **not attested by the harness**.
+The script issues no Docker commands or broad SQL cleanup. After failure it performs
+only owned-process shutdown; it never repairs SQL state or retries a test. GitHub
+eventually discards the service/runner, so retained live database resources are not
+promised. Hard cancellation or job timeout can interrupt receipts/publication and
+cannot establish verified cleanup. The job timeout is 15 minutes.
+
+The `publish` mode uses stdlib even if dependency setup fails. It writes a separate,
+nonempty safe evidence directory and copies only named JSON receipts/reports and
+redacted Uvicorn/Playwright text logs. Password/DSN text is redacted, malformed or
+sensitive files are rejected, and rejection fails publication while available safe
+diagnostics remain uploadable. A manifest records copied/rejected files and hashes.
+Raw `.artifacts/<run>/` also retains failure traces/screenshots during the job, but
+binary diagnostics, profiles, temp files and environment dumps are never uploaded.
+This intentionally limits hosted failure artifacts to privacy-checked text/JSON.
+
+Publication and upload run with `always()`. Upload requires files, retains them for
+7 days, and has no `continue-on-error`. A final gate requires the test step,
+publication and upload to succeed and the upload action to return an artifact ID.
+Earlier failures remain failures; missing evidence or failed publication/upload
+cannot produce a green job. Service-start failure before steps, runner loss or hard
+cancellation may prevent artifacts entirely and must be classified as incomplete.
+
+First-run acceptance requires a real Actions URL/job conclusion tied to the checkout
+SHA, exact versions, the two passing results, matching HTTP/UI/SQL evidence, targeted
+cleanup, process receipts and downloadable safe artifact. Service disposal must be
+reviewed separately in GitHub's job cleanup log. Registry/CDN access, Linux browser
+startup, apt dependencies and hosted cancellation behavior remain runtime UNKNOWN.
+No live AI, publishing credentials or repository secrets are used.
+
 ## RG-06B browser to PostgreSQL checks
 
 The independent package in `quality/browser/` contains exactly two Chromium

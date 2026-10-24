@@ -1,0 +1,100 @@
+name: RG-06D Chromium to PostgreSQL
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    services:
+      postgres:
+        # Official docker-library/repo-info: 17.11-bookworm, linux/amd64.
+        image: postgres:17.11-bookworm@sha256:ec4dfc6571f04fe0731ce948c1500d676af49a7224392dcc6995cc1ee33a94bb
+        env:
+          POSTGRES_DB: reqguard_rg06b
+          POSTGRES_USER: reqguard_rg06b
+          # Synthetic, job-local credential; never a repository secret.
+          POSTGRES_PASSWORD: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U reqguard_rg06b -d reqguard_rg06b"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare evidence before dependency setup
+        run: |
+          printf 'PLAYWRIGHT_BROWSERS_PATH=%s/rg06d-browsers\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          python3 -B scripts/run_rg06d_ci.py prepare
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.11.22'
+          python-version: '3.12.10'
+          enable-cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.15.0'
+          package-manager-cache: false
+      - name: Install locked dependencies and Chromium 1248
+        id: dependencies
+        run: |
+          set -euo pipefail
+          uv sync --locked --python 3.12.10 --no-dev
+          npm install --global npm@11.12.1 --ignore-scripts --no-audit --no-fund
+          npm --prefix quality/browser ci --include=dev --no-audit --no-fund
+          node -e "const b=require('./quality/browser/node_modules/playwright-core/browsers.json').browsers.find(b=>b.name==='chromium'); if(b.revision!=='1248') process.exit(1)"
+          node quality/browser/node_modules/playwright/cli.js install --with-deps --no-shell chromium
+          git diff --exit-code -- pyproject.toml uv.lock quality/browser/package.json quality/browser/package-lock.json
+      - name: Run isolated CI harness once
+        id: e2e
+        timeout-minutes: 5
+        env:
+          RG06B_DB_PORT: ${{ job.services.postgres.ports[5432] }}
+          RG06D_DB_PASSWORD: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+          UV_OFFLINE: '1'
+          UV_NO_SYNC: '1'
+          UV_PYTHON_DOWNLOADS: never
+        run: .venv/bin/python -B scripts/run_rg06d_ci.py run
+      - name: Publish only privacy-checked diagnostics
+        id: publish
+        if: ${{ always() }}
+        env:
+          RG06D_RUN_OUTCOME: ${{ steps.e2e.outcome }}
+          RG06D_DEPENDENCY_OUTCOME: ${{ steps.dependencies.outcome }}
+        run: python3 -B scripts/run_rg06d_ci.py publish
+      - name: Upload safe evidence
+        id: upload
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: rg06d-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rg06d-safe-${{ github.run_id }}-${{ github.run_attempt }}/*
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+      - name: Require execution and evidence publication
+        if: ${{ always() }}
+        env:
+          RUN_OUTCOME: ${{ steps.e2e.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          test "$RUN_OUTCOME" = success
+          test "$PUBLISH_OUTCOME" = success
+          test "$UPLOAD_OUTCOME" = success
+          test -n "$ARTIFACT_ID"
