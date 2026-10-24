@@ -1,0 +1,75 @@
+name: RG-07C Offline Evaluator
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  evaluator:
+    name: Offline evaluator (297 tests, Unicode 15.1.0)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      PYTEST_ADDOPTS: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.11.22'
+          python-version: '3.13.1'
+          enable-cache: false
+      - name: Create isolated Python 3.13.1 evaluator environment
+        run: uv venv --no-project --python 3.13.1 "$RUNNER_TEMP/rg07c-venv"
+      - name: Require Python 3.13.1 and Unicode 15.1.0 before tests
+        run: |
+          "$RUNNER_TEMP/rg07c-venv/bin/python" - <<'PY'
+          import sys
+          import unicodedata
+          print(f"Python: {sys.version}")
+          print(f"Unicode: {unicodedata.unidata_version}")
+          if sys.version_info[:3] != (3, 13, 1) or unicodedata.unidata_version != "15.1.0":
+              sys.exit("RG-07C requires Python 3.13.1 / Unicode 15.1.0")
+          PY
+      - name: Install only hash-locked pytest dependencies
+        run: |
+          set -euo pipefail
+          # Frozen export avoids resolving the product's Python 3.12 environment.
+          # The evaluator imports source directly; the product is not installed.
+          uv export --frozen --only-group dev --prune httpx --no-emit-project --no-header \
+            --output-file "$RUNNER_TEMP/rg07c-requirements.txt"
+          uv pip sync --python "$RUNNER_TEMP/rg07c-venv/bin/python" --require-hashes --only-binary :all: \
+            "$RUNNER_TEMP/rg07c-requirements.txt"
+          uv pip list --python "$RUNNER_TEMP/rg07c-venv/bin/python"
+          git diff --exit-code -- pyproject.toml uv.lock
+      - name: Run all three accepted offline suites (expected 297)
+        run: |
+          "$RUNNER_TEMP/rg07c-venv/bin/python" -m pytest -v -ra --strict-config --strict-markers \
+            -o addopts= -p no:cacheprovider \
+            --junitxml="$RUNNER_TEMP/rg07c-pytest.xml" \
+            tests/test_evaluation_dataset.py \
+            tests/test_evaluation_hard_fail.py \
+            tests/test_evaluation_metrics.py
+      - name: Require 297 executed tests with no failures, errors or skips
+        run: |
+          "$RUNNER_TEMP/rg07c-venv/bin/python" - "$RUNNER_TEMP/rg07c-pytest.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          suites = list(ET.parse(sys.argv[1]).getroot().iter("testsuite"))
+          counts = {key: sum(int(s.get(key, "0")) for s in suites)
+                    for key in ("tests", "failures", "errors", "skipped")}
+          print(f"RG-07C expected=297 actual={counts}")
+          if counts != {"tests": 297, "failures": 0, "errors": 0, "skipped": 0}:
+              sys.exit("RG-07C test count/outcome mismatch")
+          PY
