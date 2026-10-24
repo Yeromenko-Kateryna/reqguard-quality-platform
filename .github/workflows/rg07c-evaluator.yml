@@ -73,3 +73,103 @@ jobs:
           if counts != {"tests": 297, "failures": 0, "errors": 0, "skipped": 0}:
               sys.exit("RG-07C test count/outcome mismatch")
           PY
+
+  evidence-integrity:
+    name: Offline evidence integrity (173 cases, 171 passed, 2 NTFS skips)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      PYTEST_ADDOPTS: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.11.22'
+          python-version: '3.13.1'
+          enable-cache: false
+      - name: Create isolated Python 3.13.1 evidence environment
+        run: uv venv --no-project --python 3.13.1 "$RUNNER_TEMP/rg07d-d1-venv"
+      - name: Require Python 3.13.1 on Linux
+        run: |
+          "$RUNNER_TEMP/rg07d-d1-venv/bin/python" - <<'PY'
+          import sys
+          print(f"Python: {sys.version}; platform: {sys.platform}")
+          if sys.version_info[:3] != (3, 13, 1) or sys.platform != "linux":
+              sys.exit("RG-07D-D1 requires Python 3.13.1 on Linux")
+          PY
+      - name: Install only hash-locked pytest dependencies
+        run: |
+          set -euo pipefail
+          uv export --frozen --only-group dev --prune httpx --no-emit-project --no-header \
+            --output-file "$RUNNER_TEMP/rg07d-d1-requirements.txt"
+          uv pip sync --python "$RUNNER_TEMP/rg07d-d1-venv/bin/python" --require-hashes --only-binary :all: \
+            "$RUNNER_TEMP/rg07d-d1-requirements.txt"
+          uv pip list --python "$RUNNER_TEMP/rg07d-d1-venv/bin/python"
+          git diff --exit-code -- pyproject.toml uv.lock
+      - name: Run all evidence cases outside the repository (expected 173)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rg07d-d1-work"
+          cd "$RUNNER_TEMP/rg07d-d1-work"
+          # Absolute config keeps source imports; cwd, fixtures and reports stay external.
+          "$RUNNER_TEMP/rg07d-d1-venv/bin/python" -m pytest -v -ra --strict-config --strict-markers \
+            -c "$GITHUB_WORKSPACE/pyproject.toml" -o addopts= -p no:cacheprovider \
+            --basetemp="$RUNNER_TEMP/rg07d-d1-pytest-tmp" \
+            --junitxml="$RUNNER_TEMP/rg07d-d1-pytest.xml" \
+            "$GITHUB_WORKSPACE/tests/test_evaluation_evidence.py"
+      - name: Require exact outcomes, NTFS skip identities and real POSIX symlink passes
+        if: ${{ !cancelled() }}
+        run: |
+          "$RUNNER_TEMP/rg07d-d1-venv/bin/python" - "$RUNNER_TEMP/rg07d-d1-pytest.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          def require(condition, message):
+              if not condition:
+                  sys.exit(message)
+
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = list(root.iter("testsuite"))
+          counts = {key: sum(int(s.get(key, "0")) for s in suites)
+                    for key in ("tests", "failures", "errors", "skipped")}
+          require(counts == {"tests": 173, "failures": 0, "errors": 0, "skipped": 2},
+                  f"RG-07D-D1 suite count/outcome mismatch: {counts}")
+          cases = list(root.iter("testcase"))
+          identities = [(case.get("classname"), case.get("name")) for case in cases]
+          require(len(cases) == 173 and len(set(identities)) == 173,
+                  "RG-07D-D1 requires 173 distinct testcase records")
+          # pytest's classname prefix depends on rootdir; bind identity to the module.
+          require(all(cls and cls.split(".")[-1] == "test_evaluation_evidence"
+                      for cls, name in identities), "Unexpected test module")
+          outcomes = {key: sum(len(case.findall(key)) for case in cases)
+                      for key in ("failure", "error", "skipped")}
+          passed = sum(not any(case.find(key) is not None
+                               for key in ("failure", "error", "skipped")) for case in cases)
+          require(outcomes == {"failure": 0, "error": 0, "skipped": 2} and passed == 171,
+                  f"RG-07D-D1 testcase outcome mismatch: {outcomes}, passed={passed}")
+          skipped = {case.get("name"): case.find("skipped") for case in cases
+                     if case.find("skipped") is not None}
+          expected_skips = {f"test_real_windows_junction_escape[{kind}]"
+                            for kind in ("directory", "root")}
+          require(set(skipped) == expected_skips, f"Unexpected skips: {set(skipped)}")
+          reason = "NTFS junction test; POSIX runs actual symlinks"
+          require(all(node.get("type") == "pytest.skip" and node.get("message") == reason
+                      for node in skipped.values()), "Unexpected platform skip reason/type")
+          symlinks = {f"test_real_symlink_escape[{kind}]" for kind in ("file", "directory", "root")}
+          for name in sorted(symlinks):
+              matches = [case for case in cases if case.get("name") == name]
+              require(len(matches) == 1 and not any(matches[0].find(key) is not None
+                      for key in ("failure", "error", "skipped")), f"Real POSIX symlink did not pass: {name}")
+              print(f"PASS {name}")
+          print(f"RG-07D-D1 collected=173 passed={passed} counts={counts}")
+          print(f"Platform skips: {sorted(skipped)}; reason: {reason}")
+          PY
