@@ -5,6 +5,8 @@ No Docker commands: GitHub owns service disposal, which this file cannot attest.
 """
 
 import ctypes
+from datetime import datetime, timedelta
+import stat
 import hashlib
 import importlib.metadata
 import json
@@ -33,7 +35,8 @@ INPUTS = ['pyproject.toml', 'uv.lock', 'db/001_init.sql', 'reqguard/main.py',
           'scripts/run_rg06d_ci.py', '.github/workflows/rg06d-e2e.yml']
 JSON_ALLOWLIST = ['launch.json', 'postgres-ready.json', 'baseline.json', 'sentinel-plan.json',
                   'supported-response-id.json', 'supported-sql.json', 'invalid-sql.json',
-                  'supported-cleanup.json', 'sql-cleanup.json', 'results.json',
+                  'supported-cleanup.json', 'unsupported-response-id.json', 'unsupported-sql.json',
+                  'unsupported-cleanup.json', 'sql-cleanup.json', 'results.json',
                   'server-process.json', 'playwright-process.json', 'run-summary.json']
 LOG_ALLOWLIST = ['uvicorn.stdout', 'uvicorn.stderr', 'playwright.stdout', 'playwright.stderr']
 
@@ -45,6 +48,146 @@ class Stop(Exception):
 def require(ok, code):
     if not ok:
         raise Stop(code)
+
+
+# Kept identical in both harnesses: no application imports or database access.
+UNSUPPORTED_EVIDENCE_FILES = (
+    'baseline.json', 'sentinel-plan.json', 'unsupported-response-id.json',
+    'unsupported-sql.json', 'unsupported-cleanup.json', 'sql-cleanup.json',
+)
+
+
+def parse_evidence_json(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            require(key not in result, 'EVIDENCE_DUPLICATE_KEY')
+            result[key] = value
+        return result
+
+    def constant(_):
+        raise Stop('EVIDENCE_NONFINITE_JSON')
+
+    require(type(raw) is bytes and 0 < len(raw) <= 10_000_000, 'EVIDENCE_BYTES')
+    try:
+        return json.loads(raw.decode('utf-8'), object_pairs_hook=pairs, parse_constant=constant)
+    except (UnicodeError, ValueError):
+        raise Stop('EVIDENCE_JSON_INVALID') from None
+
+
+def validate_unsupported_receipts(receipts, run):
+    def shape(value, keys):
+        require(type(value) is dict and set(value) == set(keys), 'EVIDENCE_KEYS')
+        return value
+
+    def boolean(value, expected):
+        require(type(value) is bool and value is expected, 'EVIDENCE_BOOLEAN')
+
+    def identifier(value):
+        require(type(value) is str and re.fullmatch(
+            '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', value),
+            'EVIDENCE_UUID4')
+
+    def row(value, original):
+        shape(value, ('run_id', 'provider', 'status', 'original_input',
+                      'analysis_payload', 'created_at', 'sql_null'))
+        identifier(value['run_id'])
+        require(value['provider'] == 'fake' and value['status'] == 'unsupported_fixture',
+                'EVIDENCE_ROW_STATUS')
+        require(type(value['original_input']) is str and value['original_input'] == original,
+                'EVIDENCE_INPUT')
+        require(value['analysis_payload'] is None, 'EVIDENCE_SQL_NULL')
+        boolean(value['sql_null'], True)
+        stamp = value['created_at']
+        require(type(stamp) is str and re.fullmatch(r'.*\+00(?::?00)?', stamp),
+                'EVIDENCE_TIMESTAMP')
+        try:
+            parsed = datetime.fromisoformat(stamp)
+        except ValueError:
+            raise Stop('EVIDENCE_TIMESTAMP') from None
+        require(parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0),
+                'EVIDENCE_TIMESTAMP')
+        return value
+
+    require(type(run) is str and re.fullmatch('[a-f0-9]{32}', run), 'EVIDENCE_RUN')
+    shape(receipts, UNSUPPORTED_EVIDENCE_FILES)
+    docs = {name: parse_evidence_json(receipts[name]) for name in UNSUPPORTED_EVIDENCE_FILES}
+    plan = shape(docs['sentinel-plan.json'], ('run', 'run_id'))
+    require(type(plan['run']) is str and plan['run'] == run, 'EVIDENCE_SENTINEL_RUN')
+    identifier(plan['run_id'])
+    base = shape(docs['baseline.json'], ('identity', 'columns', 'constraints', 'rows'))
+    require(base['identity'] == {
+        'db': 'reqguard_rg06b', 'role': 'reqguard_rg06b', 'version': '170011',
+    }, 'EVIDENCE_DB_IDENTITY')
+    expected_columns = [
+        {'column_name': name, 'data_type': kind, 'is_nullable': nullable, 'column_default': default}
+        for name, kind, nullable, default in (
+            ('run_id', 'uuid', 'NO', None), ('provider', 'text', 'NO', None),
+            ('status', 'text', 'NO', None), ('original_input', 'text', 'NO', None),
+            ('analysis_payload', 'jsonb', 'YES', None),
+            ('created_at', 'timestamp with time zone', 'NO', 'CURRENT_TIMESTAMP'),
+        )
+    ]
+    require(base['columns'] == expected_columns, 'EVIDENCE_COLUMNS')
+    require(base['constraints'] == [
+        {'conname': 'analyses_analysis_consistency', 'definition':
+         "CHECK ((((status = 'completed'::text) AND (analysis_payload IS NOT NULL) AND (jsonb_typeof(analysis_payload) = 'object'::text)) OR ((status = 'unsupported_fixture'::text) AND (analysis_payload IS NULL))))"},
+        {'conname': 'analyses_pkey', 'definition': 'PRIMARY KEY (run_id)'},
+        {'conname': 'analyses_status_valid', 'definition':
+         "CHECK ((status = ANY (ARRAY['completed'::text, 'unsupported_fixture'::text])))"},
+    ], 'EVIDENCE_CONSTRAINTS')
+    require(type(base['rows']) is list and len(base['rows']) == 1, 'EVIDENCE_BASELINE_ROWS')
+    sentinel = row(base['rows'][0], 'RG06B owned sentinel ' + run)
+    require(sentinel['run_id'] == plan['run_id'], 'EVIDENCE_SENTINEL_ID')
+    response_id = shape(docs['unsupported-response-id.json'], ('run_id',))
+    identifier(response_id['run_id'])
+    sql = shape(docs['unsupported-sql.json'],
+                ('response', 'before', 'after', 'verified', 'browserVersion'))
+    boolean(sql['verified'], True)
+    require(type(sql['browserVersion']) is str and bool(sql['browserVersion'].strip()),
+            'EVIDENCE_BROWSER_VERSION')
+    response = shape(sql['response'], ('run_id', 'provider', 'status', 'analysis'))
+    identifier(response['run_id'])
+    require(response['run_id'] == response_id['run_id'] and
+            response['run_id'] != sentinel['run_id'], 'EVIDENCE_RESPONSE_ID')
+    require(response['provider'] == 'fake' and response['status'] == 'unsupported_fixture' and
+            response['analysis'] is None, 'EVIDENCE_RESPONSE')
+    require(type(sql['before']) is list and len(sql['before']) == 1, 'EVIDENCE_BEFORE')
+    row(sql['before'][0], sentinel['original_input'])
+    require(sql['before'] == base['rows'], 'EVIDENCE_BASELINE_CHANGED')
+    require(type(sql['after']) is list and len(sql['after']) == 2, 'EVIDENCE_AFTER')
+    original = '  A synthetic unsupported requirement ' + run + '  '
+    for item in sql['after']:
+        shape(item, ('run_id', 'provider', 'status', 'original_input',
+                     'analysis_payload', 'created_at', 'sql_null'))
+        row(item, sentinel['original_input'] if item['run_id'] == sentinel['run_id'] else original)
+    owned = [item for item in sql['after'] if item['run_id'] == response['run_id']]
+    require(len(owned) == 1 and sql['after'] == sorted(
+        [sentinel, owned[0]], key=lambda item: item['run_id']), 'EVIDENCE_ROW_DELTA')
+    cleanup = shape(docs['unsupported-cleanup.json'], ('remainingOwnedRows', 'sentinelUnchanged'))
+    require(type(cleanup['remainingOwnedRows']) is int and cleanup['remainingOwnedRows'] == 0,
+            'EVIDENCE_OWNED_CLEANUP')
+    boolean(cleanup['sentinelUnchanged'], True)
+    final = shape(docs['sql-cleanup.json'],
+                  ('state', 'supportedCleaned', 'invalidVerified', 'unsupportedCleaned', 'uncertain'))
+    require(type(final['state']) is str and final['state'] == 'CLEANED', 'EVIDENCE_CLEANUP_STATE')
+    for key in ('supportedCleaned', 'invalidVerified', 'unsupportedCleaned'):
+        boolean(final[key], True)
+    boolean(final['uncertain'], False)
+
+
+def read_unsupported_receipts(directory):
+    result = {}
+    for name in UNSUPPORTED_EVIDENCE_FILES:
+        source = directory / name
+        info = source.lstat()
+        require(stat.S_ISREG(info.st_mode) and not source.is_symlink() and
+                not (getattr(info, 'st_file_attributes', 0) & 0x400), 'EVIDENCE_FILE_TYPE')
+        with source.open('rb') as stream:
+            result[name] = stream.read(10_000_001)
+        require(0 < len(result[name]) <= 10_000_000, 'EVIDENCE_FILE_SIZE')
+    # Checks and reads are not atomic; callers must not claim race-free admission.
+    return result
 
 
 def write(path, value):
@@ -218,14 +361,18 @@ def run_tests():
                 specs.extend(suite.get('specs', []))
                 collect(suite.get('suites', []))
         collect(report['suites'])
-        require(report['stats']['expected'] == 2 and not report['errors']
+        require({s['title'] for s in specs} == {
+            'supported fixture: browser HTTP 200, visible result, independent committed SQL row',
+            'invalid whitespace: actual FastAPI HTTP 422 and unchanged SQL snapshot',
+            'unsupported fixture: browser HTTP 200, visible unsupported result, independent SQL NULL row',
+        }, 'EXACT_THREE_SCENARIOS')
+        require(report['stats']['expected'] == 3 and not report['errors']
                 and all(report['stats'][k] == 0 for k in ('unexpected', 'skipped', 'flaky'))
-                and len(specs) == 2 and all(s['ok'] and len(s['tests']) == 1
+                and len(specs) == 3 and all(s['ok'] and len(s['tests']) == 1
                 and s['tests'][0]['projectName'] == 'chromium' and s['tests'][0]['status'] == 'expected'
                 and len(s['tests'][0]['results']) == 1 and s['tests'][0]['results'][0]['status'] == 'passed'
-                and s['tests'][0]['results'][0]['retry'] == 0 for s in specs), 'EXACT_TWO_RESULTS')
-        require(json.loads((path / 'sql-cleanup.json').read_text()) == {
-            'state': 'CLEANED', 'supportedCleaned': True, 'invalidVerified': True, 'uncertain': False}, 'SQL_CLEANUP')
+                and s['tests'][0]['results'][0]['retry'] == 0 for s in specs), 'EXACT_THREE_RESULTS')
+        validate_unsupported_receipts(read_unsupported_receipts(path), path.name)
         summary.update(tests=report['stats'], sqlCleanup='VERIFIED', assertions='PASS')
     except BaseException as error:
         summary['reason'] = str(error) if isinstance(error, Stop) else 'EXECUTION_' + type(error).__name__
@@ -275,6 +422,14 @@ def publish():
     write(safe / 'publication-context.json', publication)
     try:
         raw = artifact()
+        receipt_bytes = {}
+        receipt_valid = False
+        try:
+            receipt_bytes = read_unsupported_receipts(raw)
+            validate_unsupported_receipts(receipt_bytes, os.environ['RG06B_RUN_ID'])
+            receipt_valid = True
+        except (OSError, ValueError, Stop):
+            publication['rejected'].append('UNSUPPORTED_EVIDENCE_INVALID')
         for name in JSON_ALLOWLIST + LOG_ALLOWLIST:
             source = raw / name
             if not source.exists():
@@ -282,7 +437,12 @@ def publish():
             try:
                 require(source.is_file() and not source.is_symlink() and source.stat().st_size <= 10_000_000,
                         'UNSAFE_ARTIFACT_FILE')
-                text = source.read_text(encoding='utf-8')
+                if name in UNSUPPORTED_EVIDENCE_FILES:
+                    require(receipt_valid, 'UNSUPPORTED_EVIDENCE_INVALID')
+                    require(source.read_bytes() == receipt_bytes[name], 'EVIDENCE_CHANGED')
+                    text = receipt_bytes[name].decode('utf-8')
+                else:
+                    text = source.read_text(encoding='utf-8')
                 if name in JSON_ALLOWLIST:
                     json.loads(text)
                 text = text.replace(PASSWORD, '<redacted-ci-password>')
@@ -293,11 +453,18 @@ def publish():
                                       r'https?://[^\s/:]+:[^\s@]+@', text), 'SENSITIVE_ARTIFACT')
                 if name in JSON_ALLOWLIST:
                     json.loads(text)
+                if name in UNSUPPORTED_EVIDENCE_FILES:
+                    require(text.encode('utf-8') == receipt_bytes[name], 'EVIDENCE_REDACTION_CHANGED')
                 (safe / name).write_text(text, encoding='utf-8')
                 publication['copied'].append(name)
             except (OSError, ValueError, Stop):
                 publication['rejected'].append(name)
-    except (KeyError, OSError, Stop):
+        if receipt_valid:
+            # Revalidate the copied bytes, not a previous run-success flag.
+            validate_unsupported_receipts(read_unsupported_receipts(safe), os.environ['RG06B_RUN_ID'])
+            require(read_unsupported_receipts(raw) == receipt_bytes, 'EVIDENCE_CHANGED')
+            # No lock spans this check and upload; later filesystem races remain possible.
+    except (KeyError, OSError, ValueError, Stop):
         publication['rejected'].append('RAW_EVIDENCE_UNAVAILABLE')
     if publication['runOutcome'] == 'success':
         publication['rejected'].extend('MISSING_' + name for name in JSON_ALLOWLIST + LOG_ALLOWLIST
