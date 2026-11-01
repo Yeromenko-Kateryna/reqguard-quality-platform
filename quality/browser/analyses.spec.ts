@@ -27,6 +27,7 @@ let uncertain = true;
 let inFlight = false;
 let supportedCleaned = false;
 let invalidVerified = false;
+let unsupportedCleaned = false;
 
 function receipt(name: string, value: unknown) {
   fs.writeFileSync(path.join(artifact, name), JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
@@ -168,6 +169,55 @@ test('invalid whitespace: actual FastAPI HTTP 422 and unchanged SQL snapshot', a
   } catch (error) { if (!settled) uncertain = true; throw error; }
 });
 
+test('unsupported fixture: browser HTTP 200, visible unsupported result, independent SQL NULL row', async ({ page }) => {
+  if (uncertain || !supportedCleaned || !invalidVerified) throw new Error('RG06B_PREVIOUS_OUTCOME_UNCERTAIN');
+  const before = await snapshot();
+  expect(before).toEqual(baseline);
+  const unsupported = '  A synthetic unsupported requirement ' + run + '  ';
+  await page.goto('/');
+  await page.locator('#requirement').fill(unsupported);
+  let posts = 0;
+  page.on('request', r => { if (r.method() === 'POST' && new URL(r.url()).pathname === '/analyses') posts++; });
+  let verifiedOwnership = false;
+  try {
+    inFlight = true;
+    const responsePromise = page.waitForResponse(r => r.request().method() === 'POST' && r.url() === process.env.RG06B_BASE_URL + '/analyses');
+    const [response] = await Promise.all([responsePromise, page.locator('#submit').click()]);
+    expect(response.status()).toBe(200);
+    expect(response.request().postDataJSON()).toEqual({ requirement_text: unsupported });
+    const body = await response.json();
+    expect(body.run_id).toMatch(uuid4);
+    receipt('unsupported-response-id.json', { run_id: body.run_id });
+    expect(body).toEqual({ run_id: body.run_id, provider: 'fake', status: 'unsupported_fixture', analysis: null });
+    const rows = (await sql('SELECT ' + fields + ' FROM public.analyses WHERE run_id=$1::uuid', [body.run_id])).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual({ run_id: body.run_id, provider: body.provider, status: body.status,
+      original_input: unsupported, analysis_payload: null, created_at: expect.any(String), sql_null: true });
+    expect(Number.isFinite(Date.parse(rows[0].created_at))).toBe(true);
+    expect(rows[0].created_at).toMatch(/\+00(?::?00)?$/);
+    const after = await snapshot();
+    expect(after.filter(r => r.run_id !== body.run_id)).toEqual(before);
+    expect(after).toHaveLength(before.length + 1);
+    owned = rows[0]; verifiedOwnership = true; inFlight = false;
+    await evidence('unsupported-sql', { response: body, before, after, verified: true,
+      browserVersion: page.context().browser()!.version() });
+    await expect(page.locator('#result')).toBeVisible();
+    await expect(page.locator('#run-id')).toHaveText(body.run_id);
+    await expect(page.locator('#provider')).toHaveText('fake');
+    await expect(page.locator('#status')).toHaveText('unsupported_fixture');
+    await expect(page.locator('#result')).toHaveAttribute('data-status', 'unsupported_fixture');
+    await expect(page.locator('#result-summary')).toHaveText('Unsupported fixture: this valid input has no authored analysis. No AI analysis was performed.');
+    await expect(page.locator('#analysis')).toBeEmpty();
+    expect(posts).toBe(1);
+  } catch (error) { if (!verifiedOwnership) uncertain = true; throw error; }
+  finally {
+    if (verifiedOwnership && !uncertain) {
+      await removeOwned(owned, before); owned = undefined; unsupportedCleaned = true;
+      receipt('unsupported-cleanup.json', { remainingOwnedRows: 0, sentinelUnchanged: true });
+    }
+  }
+});
+
 test.afterAll(async () => {
   let state = 'UNRESOLVED';
   try {
@@ -183,7 +233,7 @@ test.afterAll(async () => {
       })]);
     } catch { state = 'UNRESOLVED'; }
     finally { clearTimeout(timer); }
-    receipt('sql-cleanup.json', { state, supportedCleaned, invalidVerified, uncertain: uncertain || inFlight });
+    receipt('sql-cleanup.json', { state, supportedCleaned, invalidVerified, unsupportedCleaned, uncertain: uncertain || inFlight });
     if (state !== 'CLEANED') throw new Error('RG06B_DATABASE_RETAINED_UNRESOLVED');
   }
 });
