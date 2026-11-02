@@ -8,13 +8,16 @@ database row by `run_id`. The product uses a **deterministic fake provider** wit
 no live model calls. The separate offline AI Quality component verifies evaluation
 mechanics; its passing tests do **not** prove live-model semantic quality.
 
-This guide describes accepted baseline
-[`3b04823484222c1063d3f58f428535198c8be10e`](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/commit/3b04823484222c1063d3f58f428535198c8be10e)
-(RG-STATE-01 / 2026-10-27 task baseline).
+**Documentation provenance (2026-11-01).** This guide was updated from accepted merge
+[`ca03b640bfaa5c8691efda620e993ed5a38242db`](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/commit/ca03b640bfaa5c8691efda620e993ed5a38242db);
+the revision containing this updated guide must be independently reviewed
+and identified through the public revision record required in step 0.
+The earlier RG-STATE-01 / 2026-10-27 guide described
+[`3b04823484222c1063d3f58f428535198c8be10e`](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/commit/3b04823484222c1063d3f58f428535198c8be10e).
+RG-README-02 was a pre-publication review label, not a setup dependency.
 “Portfolio v1.0” labels the portfolio scope; application/package metadata remains
-`0.1.0`. **Portfolio V1.0 is not yet declared released.** Runtime inputs below
-are tracked in that baseline. This RG-README-02 correction is a local review draft;
-the published README at the baseline is an earlier revision.
+`0.1.0`. **Portfolio V1.0 is not yet declared released.** Use only the runtime
+inputs and tracked README of the immutable revision admitted in step 0.
 
 ## Architecture and published behavior
 
@@ -53,7 +56,8 @@ password-reset test.
 ## Reproduce the browser-to-database demo
 
 Commands use **Windows PowerShell 5.1 or PowerShell 7**, on Windows x64, from the
-repository root unless stated otherwise. Prerequisites: Git, uv, CPython 3.12,
+repository root unless stated otherwise. Prerequisites: Git 2.49 or later (for
+`clone --revision` in step 0), uv, CPython 3.12,
 Docker Desktop with a running local Linux engine and Compose, and a
 JavaScript-enabled browser. Node is needed only for frontend tests or Playwright.
 The Windows browser launcher enforces CPython 3.12 x64, Node **24.15.0**, npm
@@ -64,18 +68,52 @@ launcher gates. Offline evaluation requires separate Python **3.13.1**.
 Setup can download locked packages and the PostgreSQL image. Credentials below
 are synthetic local demo credentials.
 
-**RG-README-02 execution status:** static source/command review only. Fresh Windows
-setup, Docker/schema initialization, browser/HTTP/SQL verification, product tests,
-smoke, E2E, shutdown and offline setup/execution were **NOT RUN in this task**.
+**Windows execution status (2026-11-01): `WINDOWS_REPRODUCTION = NOT_EXECUTED`.**
+This README-only correction used static verification. Fresh Windows setup,
+Docker/schema initialization, browser/HTTP/SQL verification, product tests, smoke,
+E2E, shutdown and offline setup/execution were **NOT RUN in this task**.
 Historical local tests, hosted Linux CI and accepted Codespace manual evidence
 below do not establish execution of this corrected Windows procedure.
 
+**Open execution-safety dependencies: `RUNTIME_SAFETY_D_TO_J = OPEN`.**
+`README_DOCUMENTATION_CORRECTED != WINDOWS_RUNTIME_VERIFIED`. This candidate does
+not authorize execution. Before affected runtime steps, obtain independent
+disposition and explicit authorization; STOP if ownership or outcomes are uncertain.
+README-only changes do not repair these implementation/execution limitations:
+
+- **D — Root Compose:** fixed project, volume and ports; absence before startup and
+  matching names/labels do not establish creation ownership across a race.
+- **E — Network/SQL smoke:** SQL target identity is not immutably bound to the HTTP
+  database; cleanup can follow incomplete independent row-ownership verification.
+- **F — PostgreSQL integration:** deletion by collected UUID lacks the stronger
+  independent ownership revalidation contract.
+- **G — Browser launcher:** resource inspection/use is not atomic; schema bind checks
+  do not verify the exact host source path.
+- **H — Image provenance:** local PostgreSQL uses a mutable tag; CI pins a digest.
+- **I — Windows compatibility:** PowerShell argument behavior, Docker backend,
+  Job Objects and NTFS-specific behavior still need witnessed Windows evidence.
+- **J — Evidence:** private artifacts, integrity checks, retention and separate
+  validation/copy/publication steps retain race boundaries; no atomicity is claimed.
+
 ### 0. Use a new checkout and verify the reviewed guide
 
-**Pre-publication review procedure:** the clone-and-replace README workflow below
-requires the separately supplied reviewed README artifact and hash. It is not a
-standalone public reproduction procedure. It cannot be presented as standalone
-public reproduction until the corrected README is committed and published.
+Use `REVIEWED_REVISION = full 40-character Git commit SHA` from a specific,
+publicly accessible release/review record that explicitly approves that exact
+revision and its tracked reproduction guide. Record the URL, full SHA and review
+decision. A moving branch, ordinary commit listing or PR is not automatically proof
+of that approval. Inspect the record itself before confirming below; URL syntax
+checks and an operator confirmation do not independently authenticate its contents.
+
+**Public provenance status (2026-11-01): `PUBLIC_REVIEW_RECORD = UNRESOLVED`.**
+No qualifying public record for a revision containing this correction has been
+established. STOP before reproduction until one is available. The historical audit
+baseline is not the unknown future commit containing an accepted corrected README.
+Do not embed that future README's own commit SHA as a permanent expected literal.
+
+The command below uses [Git's `clone --revision`](https://git-scm.com/docs/git-clone/2.49.0)
+to select the supplied commit with detached HEAD, without a moving-main checkout
+or local branch. Unsupported Git, unavailable revision or any command failure
+means STOP; do not fall back to cloning the current branch tip.
 
 Do not run fresh-user setup in the protected dirty working tree. Use a new
 PowerShell session, trusted tools on PATH, and an absent destination under a
@@ -90,18 +128,32 @@ $ErrorActionPreference = 'Stop'
 function Assert-Native {
     if ($LASTEXITCODE -ne 0) { throw "Native command failed (exit $LASTEXITCODE); STOP" }
 }
+$port01ReviewRecord = Read-Host 'HTTPS URL of the public release/review record'
+[uri]$port01ReviewUri = $null
+if (-not [uri]::TryCreate($port01ReviewRecord, [UriKind]::Absolute, [ref]$port01ReviewUri) -or
+    $port01ReviewUri.Scheme -ne 'https' -or $port01ReviewUri.UserInfo) {
+    throw 'A public HTTPS review-record URL without credentials is required'
+}
+$REVIEWED_REVISION = Read-Host 'Full 40-character commit SHA explicitly approved in that record'
+if ($REVIEWED_REVISION -notmatch '\A[0-9a-fA-F]{40}\z') {
+    throw 'A complete reviewed commit SHA is required'
+}
+$REVIEWED_REVISION = $REVIEWED_REVISION.ToLowerInvariant()
+if ((Read-Host 'Type REVIEWED after checking the record approves this SHA and its tracked guide') -cne 'REVIEWED') {
+    throw 'Public revision provenance is unconfirmed; STOP'
+}
 $port01Target = Read-Host 'Absolute NEW checkout directory (must not exist)'
 if (-not [IO.Path]::IsPathRooted($port01Target) -or (Test-Path -LiteralPath $port01Target)) {
     throw 'An absolute absent destination is required'
 }
-git clone --branch main --single-branch https://github.com/Yeromenko-Kateryna/reqguard-quality-platform.git $port01Target
+git clone "--revision=$REVIEWED_REVISION" --no-tags https://github.com/Yeromenko-Kateryna/reqguard-quality-platform.git $port01Target
 Assert-Native
 Set-Location -LiteralPath $port01Target
 $port01Repo = (Get-Location).Path
 $port01Head = git rev-parse HEAD
 Assert-Native
-if ($port01Head -ne '3b04823484222c1063d3f58f428535198c8be10e') {
-    throw 'Remote main differs from reviewed baseline; obtain a reviewed procedure for that revision'
+if ($port01Head -ne $REVIEWED_REVISION) {
+    throw 'Checkout differs from the reviewed immutable revision; STOP'
 }
 $port01InitialStatus = @(git status --porcelain=v1 -uall)
 Assert-Native
@@ -109,23 +161,13 @@ if ($port01InitialStatus.Count) { throw 'New checkout is not clean' }
 Get-FileHash -LiteralPath README.md -Algorithm SHA256
 ```
 
-Before setup, obtain the **RG-00-reviewed RG-README-02 README artifact and its
-SHA-256 from the review handoff**, place that README in this new checkout, then
-compare below. The published baseline README is an earlier guide. There is no
-self-referential expected hash here. Until that handoff exists, stop before setup;
-recording a hash alone is not verification. Do not copy other protected/untracked
-files from the original working tree.
-
-```powershell
-$port01ExpectedReadme = Read-Host 'Reviewed RG-README-02 README SHA-256 from handoff'
-if ($port01ExpectedReadme -notmatch '^[a-fA-F0-9]{64}$' -or
-    (Get-FileHash -LiteralPath README.md -Algorithm SHA256).Hash -ne $port01ExpectedReadme) {
-    throw 'Reviewed README hash mismatch'
-}
-$port01OtherChanges = @(git status --porcelain=v1 -uall -- . ':!README.md')
-Assert-Native
-if ($port01OtherChanges.Count) { throw 'Unexpected checkout changes' }
-```
+Use the README tracked in this admitted revision directly. Do not replace it or
+copy protected/untracked files from the original working tree. The clean-checkout
+check includes README; any unexpected change means STOP. Record its file hash as
+evidence of the working copy, not as a substitute for reviewed revision provenance.
+Windows checkout line endings can differ from repository blob bytes; record which
+representation a digest describes. No private README artifact or hash handoff is
+an active setup dependency.
 
 ### 1. Preflight environment/resources, then install the product
 
@@ -372,9 +414,20 @@ runtime and external directory layout below.
 
 ### Independent Chromium → API → SQL (Windows)
 
-[Two Playwright specs](quality/browser/analyses.spec.ts) exercise a completed fixture
-and whitespace rejection against real FastAPI/PostgreSQL. They compare HTTP/UI/SQL,
-the full table delta, actual 422 and unchanged SQL snapshots, with a sentinel.
+[Three named Playwright scenarios](quality/browser/analyses.spec.ts) exercise real
+FastAPI/PostgreSQL through Chromium:
+
+- **Supported fixture:** HTTP 200, visible completed result, consistent run ID and
+  stored fields, and an independently verified committed SQL row.
+- **Invalid whitespace:** actual FastAPI HTTP 422, rejected input and an unchanged
+  SQL before/after snapshot.
+- **Unsupported fixture:** HTTP 200, visible unsupported result, `provider=fake`,
+  `status=unsupported_fixture`, and an independently verified committed row with
+  actual SQL NULL `analysis_payload`; original input, including surrounding
+  whitespace, is preserved.
+
+The scenarios compare full table deltas and preserve an independently recorded
+baseline/sentinel while verifying ownership-scoped cleanup.
 
 The [launcher](scripts/run_rg06b_e2e.py) requires Windows x64 CPython 3.12, Node
 **24.15.0**, npm **11.12.1**, Compose **2.x or exactly 5.5.1**, a local named-pipe
@@ -413,8 +466,17 @@ Do not invoke `npm test` directly: config requires launcher metadata. The launch
 does no downloads/builds. It creates a fresh random Compose project/volume and
 loopback ports with [its own Compose file](quality/browser/compose.rg06b.yaml),
 independently of the root demo. It runs serially, without retries, and owns process
-trees via Windows Job Objects. Exit zero requires exactly two passing results,
-verified targeted SQL cleanup, process completion and checked Docker teardown.
+trees via Windows Job Objects. Exit zero requires exactly three named Chromium
+scenarios, one passing result each, zero failures/unexpected outcomes, zero skips,
+zero flaky results and zero retries. It also requires validated SQL evidence,
+verified targeted cleanup, process completion and checked Docker teardown.
+Required evidence includes `baseline.json`, `sentinel-plan.json`, supported response,
+SQL and cleanup receipts, `invalid-sql.json`, `unsupported-response-id.json`,
+`unsupported-sql.json`, `unsupported-cleanup.json` and `sql-cleanup.json`.
+The final SQL receipt must report `CLEANED`, supported/invalid/unsupported checks
+complete and no uncertainty; the harness cross-checks unsupported UUID, SQL NULL,
+exact input, baseline/sentinel and zero remaining owned rows. These implemented
+gates do not resolve the open D–J limitations or establish Windows execution.
 Failures retain new resources/private artifacts; inspect before rerunning.
 Receipts, results and failure traces/screenshots live in
 `quality/browser/.artifacts/<uuid>/`; review/redact raw files before sharing.
@@ -465,7 +527,8 @@ PowerShell reproduction of accepted modules (**fresh Windows setup/execution
 unverified**), in a separate fresh terminal after the environment/configuration
 review from step 1 (do not start Docker or run its resource section). Recreate
 `Assert-Native` and `$ErrorActionPreference = 'Stop'`, enter the reviewed checkout,
-and verify the baseline/README hash. Do not inherit product `UV_PROJECT_ENVIRONMENT`,
+and verify the reviewed immutable HEAD and tracked README as in step 0. Do not
+inherit product `UV_PROJECT_ENVIRONMENT`,
 `DATABASE_URL` or a virtualenv activation. All directories below are generated:
 
 ```powershell
@@ -519,18 +582,26 @@ RG-README-02 revision; no Docker command was executed for the correction.
 | Persistence unit | [test_persistence_unit.py](tests/test_persistence_unit.py) | Mapping, binding, COMMIT boundary, sanitized failures/no retries; no real DB. |
 | UI HTTP / frontend | [test_ui.py](tests/test_ui.py), [ui.test.mjs](tests/ui.test.mjs) | Routes/assets, API mapping, request/state/errors, text rendering; stubs/DOM adapter. Not standalone suites in current workflows. |
 | Real DB / smoke | [test_postgres_integration.py](tests/test_postgres_integration.py), [smoke](scripts/rg04_network_sql_smoke.py) | Committed reads, exact schema, constraints, rollback, SQL NULL and targeted cleanup. Not standalone Actions jobs. |
-| Browser E2E | [analyses.spec.ts](quality/browser/analyses.spec.ts), [CI harness](scripts/run_rg06d_ci.py), [workflow](.github/workflows/rg06d-e2e.yml) | Two Chromium scenarios; real UI/HTTP/SQL, sentinel and cleanup receipts. |
+| Browser E2E | [analyses.spec.ts](quality/browser/analyses.spec.ts), [CI harness](scripts/run_rg06d_ci.py), [workflow](.github/workflows/rg06d-e2e.yml) | Three Chromium scenarios: supported, invalid whitespace and unsupported; real UI/HTTP/SQL, SQL NULL, preserved input, sentinel and cleanup receipts. |
 | Offline rules / metrics | [dataset](tests/test_evaluation_dataset.py), [hard-fail](tests/test_evaluation_hard_fail.py), [metrics](tests/test_evaluation_metrics.py) | 297 expected cases; synthetic data, mechanical rules, aggregation and incomplete-evidence gates. |
 | Evidence integrity | [evidence tests](tests/test_evaluation_evidence.py) | 173 expected cases; Linux gate requires 171 passes and exactly two NTFS-only skips, plus real POSIX symlink passes. |
 | Fake execution | [provider](tests/test_evaluation_fake_provider.py), [execution](tests/test_evaluation_execution.py) | 101 expected passes; deterministic outputs, provenance, deadlines, cancellation, partial failure; exact identity gate. |
 
-Current run metadata and job/step conclusions were verified read-only through the
+Accepted post-merge Linux CI (owner/RG-00 review evidence, 2026-11-01) at
+`ca03b640bfaa5c8691efda620e993ed5a38242db`:
+[RG-06D 41321279317](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/41321279317)
+and [RG-07C 41321279225](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/41321279225)
+succeeded. The accepted Chromium result is **3/3 PASS**, including unsupported SQL
+NULL persistence and targeted cleanup. No CI or runtime was executed for this
+README correction; accepted Linux results do not verify this Windows procedure.
+
+Historical run metadata and job/step conclusions were verified read-only through the
 GitHub API on **2026-10-27**. Both runs are completed/success, push to `main`,
 attempt 1, at **`3b04823484222c1063d3f58f428535198c8be10e`**, completed on
 2026-10-26. This is Linux hosted evidence, not literal Windows execution or a run
-of this uncommitted README revision. Logs/artifact bytes were not re-audited here.
+of the then-uncommitted RG-README-02 revision. Logs/artifact bytes were not re-audited here.
 
-| Current workflow run | Verified job conclusions |
+| Historical workflow run (2026-10-27 review) | Verified job conclusions |
 | --- | --- |
 | [RG-06D — 40362887104](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/40362887104) | [e2e](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/40362887104/job/121712748700): success; harness, privacy publication, upload/final gate and Stop containers steps success. |
 | [RG-07C — 40362887081](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/40362887081) | [evaluator](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/40362887081/job/121712748210), [evidence integrity](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/40362887081/job/121712747471), [fake execution](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/40362887081/job/121712748116): success, including strict count/identity gates. |
@@ -563,7 +634,8 @@ unit/integration/browser job. Action revisions are pinned by full SHA.
 For E2E review, inspect job logs and the run's **Artifacts** section. The API listed
 `rg06d-40175289284-1` (ID `12591414068`, 12,200 bytes, not expired at verification;
 expiry `2026-11-01T09:07:00Z`). Artifact bytes and individual logs were **not
-downloaded/re-audited for PORT-01**. Harness gates require two passing results,
+downloaded/re-audited for PORT-01**. That historical two-scenario harness required
+two passing results,
 zero failures/skips/flaky/retries, `CLEANED` SQL evidence and verified process
 shutdown. Publication/upload success and an artifact ID are additional final gates.
 The safe artifact contains named JSON receipts/reports, redacted text logs and
