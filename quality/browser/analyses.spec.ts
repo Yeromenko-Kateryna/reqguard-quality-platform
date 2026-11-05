@@ -2,14 +2,15 @@ import { test, expect } from '@playwright/test';
 import pg from 'pg';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { createOwnedCleanup, analysisFields, OwnershipRejected } from './owned-cleanup.ts';
 
 test.describe.configure({ mode: 'serial' });
 const fixture = 'The user can quickly reset their password';
 const artifact = process.env.RG06B_ARTIFACT!;
 const run = process.env.RG06B_RUN_ID!;
 const uuid4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const fields = 'run_id::text, provider, status, original_input, analysis_payload, created_at::text, analysis_payload IS NULL AS sql_null';
+const fields = analysisFields;
 const analysis = {
   ambiguities: [{ term: 'quickly', explanation: "The word 'quickly' does not specify a measurable duration." }],
   missing_measurable_criteria: ['Define the maximum allowed password-reset duration and its start/end events.'],
@@ -28,6 +29,9 @@ let inFlight = false;
 let supportedCleaned = false;
 let invalidVerified = false;
 let unsupportedCleaned = false;
+let cleanup: ReturnType<typeof createOwnedCleanup>;
+let cleanupQueries = 0;
+let cleanupDeletes = 0;
 
 function receipt(name: string, value: unknown) {
   fs.writeFileSync(path.join(artifact, name), JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
@@ -39,19 +43,15 @@ async function sql(text: string, values: any[] = []) {
 async function snapshot() {
   return (await sql('SELECT ' + fields + ' FROM public.analyses ORDER BY run_id')).rows;
 }
+function makeCleanup(ownerRun: string) {
+  return createOwnedCleanup(ownerRun, async (text, values = []) => {
+    cleanupQueries++;
+    if (/\bDELETE\b/i.test(text)) cleanupDeletes++;
+    return sql(text, values);
+  }, () => { uncertain = true; }, async () => { await client!.query('ROLLBACK'); });
+}
 async function removeOwned(row: any, expectedAfter: any[]) {
-  try {
-    await sql('BEGIN');
-    expect((await sql('SELECT ' + fields + ' FROM public.analyses WHERE run_id=$1::uuid FOR UPDATE', [row.run_id])).rows).toEqual([row]);
-    expect((await sql('DELETE FROM public.analyses WHERE run_id=$1::uuid RETURNING run_id', [row.run_id])).rowCount).toBe(1);
-    expect(await snapshot()).toEqual(expectedAfter);
-    await sql('COMMIT');
-    expect(await snapshot()).toEqual(expectedAfter);
-  } catch (error) {
-    uncertain = true;
-    try { await client!.query('ROLLBACK'); } catch { /* An uncertain COMMIT remains uncertain. */ }
-    throw error;
-  }
+  await cleanup.removeOwned(row, expectedAfter);
 }
 async function evidence(name: string, value: unknown) {
   receipt(name + '.json', value);
@@ -79,6 +79,65 @@ test.beforeAll(async () => {
     { conname: 'analyses_status_valid', definition: "CHECK ((status = ANY (ARRAY['completed'::text, 'unsupported_fixture'::text])))" },
   ]);
   expect(await snapshot()).toEqual([]);
+  // One database-backed negative regression, before the three browser cases.
+  // The launcher and identity checks above admit this disposable connection only;
+  // this does not attest the API pool or close RG-05 B-05/B-06/B-08/B-10.
+  cleanup = makeCleanup(run);
+  const foreignRun = randomUUID().replaceAll('-', '');
+  expect(foreignRun).not.toBe(run);
+  const fixtureOwner = makeCleanup(foreignRun);
+  const foreignId = randomUUID();
+  const beforeFixture = await snapshot();
+  expect(beforeFixture).toEqual([]);
+  const marker = 'RG06B synthetic foreign fixture ' + foreignRun;
+  await sql('INSERT INTO public.analyses(run_id,provider,status,original_input,analysis_payload) VALUES($1::uuid,$2,$3,$4,NULL)',
+    [foreignId, 'fake', 'unsupported_fixture', marker]);
+  const foreignSnapshot = await snapshot();
+  expect(foreignSnapshot).toHaveLength(1);
+  const foreignBefore = foreignSnapshot[0];
+  expect(foreignBefore).toEqual({ run_id: foreignId, provider: 'fake', status: 'unsupported_fixture',
+    original_input: marker, analysis_payload: null, created_at: expect.any(String), sql_null: true });
+  expect(Number.isFinite(Date.parse(foreignBefore.created_at))).toBe(true);
+  // Only the independent synthetic fixture owner receives creation evidence.
+  fixtureOwner.registerCreated(foreignBefore, {
+    run: foreignRun, operation: 'foreign-fixture-insert', before: beforeFixture, after: foreignSnapshot,
+  });
+  const callsBefore = cleanupQueries;
+  const deletesBefore = cleanupDeletes;
+  let rejection: unknown;
+  await expect(cleanup.removeOwned(foreignBefore, beforeFixture).catch(error => {
+    rejection = error; throw error;
+  })).rejects.toThrow('RG06B_UNOWNED_CLEANUP');
+  expect(rejection).toBeInstanceOf(OwnershipRejected);
+  const deleteInvocations = cleanupDeletes - deletesBefore;
+  const sqlInvocations = cleanupQueries - callsBefore;
+  expect(deleteInvocations).toBe(0);
+  expect(sqlInvocations).toBe(0);
+  const foreignAfter = await snapshot();
+  expect(foreignAfter).toEqual(foreignSnapshot); // Includes all six stored fields and SQL-NULL evidence.
+  // Finalize immutable preservation evidence BEFORE authorizing fixture teardown.
+  // CI validates this separate file and its hash; a later successful cleanup is insufficient.
+  const launch = JSON.parse(fs.readFileSync(path.join(artifact, 'launch.json'), 'utf8'));
+  const preservation = {
+    schema_version: 'rg06d-ownership-v1', run_id: run, source_identity: launch.source_identity ?? null,
+    scenario: 'foreign-row-rejection', foreign_run_id: foreignId, registry_owner: foreignRun,
+    ownership_rejection: rejection instanceof OwnershipRejected ? 'OwnershipRejected' : 'UNKNOWN',
+    sql_dispatch_count: sqlInvocations, delete_dispatch_count: deleteInvocations,
+    foreign_row_before: foreignBefore, foreign_row_after: foreignAfter[0],
+    preservation_verified: true, preservation_verified_before_teardown: true,
+    fixture_teardown: 'NOT_ATTEMPTED',
+  };
+  receipt('ownership-preservation.json', preservation);
+  const preservationHash = createHash('sha256').update(fs.readFileSync(path.join(artifact, 'ownership-preservation.json'))).digest('hex');
+  // No finally-based destructive cleanup: any failed assertion/SQL leaves the DB unresolved.
+  await fixtureOwner.removeOwned(foreignBefore, beforeFixture);
+  expect(await snapshot()).toEqual(beforeFixture);
+  receipt('ownership.json', { ...preservation, fixture_teardown: 'COMMITTED_BASELINE_RESTORED',
+    preservation_sha256: preservationHash });
+  console.log('RG06B_OWNERSHIP_NEGATIVE ' + JSON.stringify({
+    identity, ownershipRejection: 'RG06B_UNOWNED_CLEANUP', deleteInvocations,
+    before: foreignSnapshot, after: foreignAfter, fixtureTeardown: 'COMMITTED_AND_BASELINE_RESTORED',
+  }));
   const id = randomUUID();
   receipt('sentinel-plan.json', { run, run_id: id });
   await sql('INSERT INTO public.analyses(run_id,provider,status,original_input,analysis_payload) VALUES($1::uuid,$2,$3,$4,NULL)',
@@ -88,6 +147,7 @@ test.beforeAll(async () => {
   sentinel = baseline[0];
   expect(sentinel).toMatchObject({ run_id: id, provider: 'fake', status: 'unsupported_fixture',
     original_input: 'RG06B owned sentinel ' + run, analysis_payload: null, sql_null: true });
+  cleanup.registerCreated(sentinel, { run, operation: 'sentinel-insert', before: [], after: baseline });
   receipt('baseline.json', { identity, columns, constraints, rows: baseline });
   uncertain = false;
 });
@@ -116,6 +176,7 @@ test('supported fixture: browser HTTP 200, visible result, independent committed
     const after = await snapshot();
     expect(after.filter(r => r.run_id !== body.run_id)).toEqual(baseline);
     expect(after).toHaveLength(baseline.length + 1);
+    cleanup.registerCreated(rows[0], { run, operation: 'supported-http', before: baseline, after });
     owned = rows[0]; verifiedOwnership = true; inFlight = false;
     await evidence('supported-sql', { response: body, before: baseline, after, verified: true,
       browserVersion: page.context().browser()!.version() });
@@ -198,6 +259,7 @@ test('unsupported fixture: browser HTTP 200, visible unsupported result, indepen
     const after = await snapshot();
     expect(after.filter(r => r.run_id !== body.run_id)).toEqual(before);
     expect(after).toHaveLength(before.length + 1);
+    cleanup.registerCreated(rows[0], { run, operation: 'unsupported-http', before, after });
     owned = rows[0]; verifiedOwnership = true; inFlight = false;
     await evidence('unsupported-sql', { response: body, before, after, verified: true,
       browserVersion: page.context().browser()!.version() });
