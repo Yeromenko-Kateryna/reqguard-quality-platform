@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 import shutil
@@ -486,6 +487,293 @@ class PreloadGateTests(unittest.TestCase):
                     with self.assertRaises(a.AdmissionError): ci.preload_gate(directory, SOURCE)
                     self.assertEqual(command.call_args.kwargs['env']['RG06D_REQUIRE_PG_PRELOAD_TEST'], '1')
                     self.assertEqual(command.call_args.args[0][-1], 'quality/browser/ci-preload.integration.test.mjs')
+
+
+class MergeCheckoutTests(unittest.TestCase):
+    """Real Git objects and source_identity; all writes stay in an external temp repo."""
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='rg06d-source-')
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.root = Path(cls.temp.name)
+        cls.git_env = {**os.environ, 'GIT_AUTHOR_NAME': 'Synthetic QA',
+                       'GIT_AUTHOR_EMAIL': 'qa@example.invalid', 'GIT_COMMITTER_NAME': 'Synthetic QA',
+                       'GIT_COMMITTER_EMAIL': 'qa@example.invalid',
+                       'GIT_AUTHOR_DATE': '2026-11-05T12:00:00+00:00',
+                       'GIT_COMMITTER_DATE': '2026-11-05T12:00:00+00:00'}
+        cls.git('init', '--quiet')
+        cls.tree = cls.git('mktree', data=b'')
+        cls.base = cls.commit('base')
+        cls.head = cls.commit('feature', cls.base)
+        cls.extra = cls.commit('other', cls.base)
+        cls.merge = cls.commit('tested merge', cls.base, cls.head)
+        (cls.root / 'uv.lock').write_bytes(b'synthetic python lock\n')
+        (cls.root / 'node.lock').write_bytes(b'synthetic node lock\n')
+
+    @classmethod
+    def git(cls, *args, data=None):
+        return subprocess.check_output(['git', *args], cwd=cls.root, env=cls.git_env,
+                                       input=data, stderr=subprocess.DEVNULL).decode().strip()
+
+    @classmethod
+    def commit(cls, message, *parents):
+        args = ['commit-tree', cls.tree]
+        for parent in parents:
+            args.extend(('-p', parent))
+        return cls.git(*args, data=message.encode())
+
+    def setUp(self):
+        self.git('update-ref', 'HEAD', self.merge)
+        repo = {'id': 123, 'name': 'reqguard-quality-platform', 'full_name': a.OFFICIAL_REPOSITORY,
+                'owner': {'login': 'Yeromenko-Kateryna', 'id': 456}, 'fork': False}
+        self.event = {'number': 3, 'repository': copy.deepcopy(repo), 'pull_request': {
+            'number': 3, 'merge_commit_sha': self.merge,
+            'base': {'sha': self.base, 'ref': 'main', 'label': 'Yeromenko-Kateryna:main',
+                     'repo': copy.deepcopy(repo)},
+            'head': {'sha': self.head, 'ref': 'codex/source-test',
+                     'label': 'Yeromenko-Kateryna:codex/source-test', 'repo': copy.deepcopy(repo)}}}
+        self.env = {'GITHUB_SHA': self.merge, 'GITHUB_EVENT_NAME': 'pull_request',
+                    'GITHUB_EVENT_PATH': str(self.root / 'event.json'), 'GITHUB_REF': 'refs/pull/3/merge',
+                    'GITHUB_REPOSITORY': a.OFFICIAL_REPOSITORY, 'GITHUB_REPOSITORY_ID': '123',
+                    'GITHUB_REPOSITORY_OWNER': 'Yeromenko-Kateryna', 'GITHUB_REPOSITORY_OWNER_ID': '456',
+                    'GITHUB_BASE_REF': 'main', 'GITHUB_HEAD_REF': 'codex/source-test',
+                    'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1'}
+        (self.root / 'uv.lock').write_bytes(b'synthetic python lock\n')
+        self.enterContext(patch.object(ci, 'ROOT', self.root))
+        # Keep the evidence lock-field contract while using small synthetic inputs.
+        (self.root / 'quality/browser').mkdir(parents=True, exist_ok=True)
+        (self.root / 'quality/browser/package-lock.json').write_bytes(b'synthetic node lock\n')
+        self.enterContext(patch.object(ci, 'INPUTS', ['uv.lock', 'quality/browser/package-lock.json']))
+        self.enterContext(patch.dict('os.environ', self.env))
+
+    def identity(self):
+        (self.root / 'event.json').write_bytes(encoded(self.event))
+        return ci.source_identity()
+
+    def reject(self, code):
+        with self.assertRaisesRegex((a.AdmissionError, ci.Stop), '^' + code + '$'):
+            self.identity()
+
+    def checkout(self, oid):
+        self.git('update-ref', 'HEAD', oid)
+        os.environ['GITHUB_SHA'] = oid
+
+    def test_valid_merge_real_source_identity(self):
+        value = self.identity()
+        self.assertEqual(set(value), set(a.SOURCE_KEYS))
+        self.assertEqual((value['checkout_sha'], value['tested_merge_sha']), (self.merge, self.merge))
+        self.assertEqual((value['pr_base_sha'], value['pr_head_sha']), (self.base, self.head))
+        a.validate_source(value, value)
+
+    def test_stale_event_merge_sha_passes(self):
+        self.event['pull_request']['merge_commit_sha'] = self.extra
+        self.assertEqual(self.identity()['checkout_sha'], self.merge)
+
+    def test_missing_event_merge_sha_passes(self):
+        del self.event['pull_request']['merge_commit_sha']
+        self.assertEqual(self.identity()['checkout_sha'], self.merge)
+
+    def test_head_sha_mismatch(self):
+        with patch.dict('os.environ', {'GITHUB_SHA': self.head}): self.reject('CHECKOUT_EVENT_SHA')
+
+    def test_wrong_merge_ref(self):
+        with patch.dict('os.environ', {'GITHUB_REF': 'refs/pull/3/head'}): self.reject('SOURCE_PR_REF')
+
+    def test_wrong_pr_number(self):
+        for value in (True, 0, -1, '3', 4):
+            with self.subTest(number=value):
+                self.event['pull_request']['number'] = value
+                self.reject('SOURCE_PR_NUMBER')
+
+    def test_non_pr_event_cannot_use_pr_path(self):
+        for kind in ('push', 'workflow_dispatch', 'pull_request_target', 'unknown'):
+            with self.subTest(event=kind), patch.dict('os.environ', {'GITHUB_EVENT_NAME': kind}):
+                self.reject('SOURCE_NON_PR_CONTEXT' if kind in ('push', 'workflow_dispatch') else 'SOURCE_EVENT_KIND')
+
+    def test_missing_required_event_fields(self):
+        original = copy.deepcopy(self.event)
+        for path, code in ((('repository',), 'SOURCE_REPOSITORY_FIELDS'),
+                           (('pull_request',), 'SOURCE_PR_FIELDS'),
+                           (('number',), 'SOURCE_PR_NUMBER'),
+                           (('pull_request', 'head'), 'SOURCE_PR_FIELDS'),
+                           (('pull_request', 'head', 'sha'), 'SOURCE_COMMIT_OID'),
+                           (('pull_request', 'base', 'repo'), 'SOURCE_REPOSITORY_FIELDS'),
+                           (('pull_request', 'head', 'label'), 'SOURCE_PR_BRANCH_CONTEXT')):
+            self.event = copy.deepcopy(original)
+            target = self.event
+            for part in path[:-1]: target = target[part]
+            del target[path[-1]]
+            with self.subTest(path=path): self.reject(code)
+
+    def test_missing_required_execution_fields(self):
+        for key, code in (('GITHUB_SHA', 'SOURCE_COMMIT_OID'),
+                          ('GITHUB_REPOSITORY_ID', 'SOURCE_REPOSITORY_CONTEXT'),
+                          ('GITHUB_REPOSITORY_OWNER_ID', 'SOURCE_REPOSITORY_CONTEXT'),
+                          ('GITHUB_REF', 'SOURCE_PR_REF'),
+                          ('GITHUB_HEAD_REF', 'SOURCE_PR_BRANCH_CONTEXT'),
+                          ('GITHUB_BASE_REF', 'SOURCE_PR_BRANCH_CONTEXT')):
+            env = dict(os.environ); del env[key]
+            with self.subTest(key=key), patch.dict('os.environ', env, clear=True): self.reject(code)
+
+    def test_malformed_sha_and_json(self):
+        for sha in ('abc', 'F' * 40, '../HEAD', 123, None):
+            self.event['pull_request']['head']['sha'] = sha
+            with self.subTest(sha=sha): self.reject('SOURCE_COMMIT_OID')
+        for raw, code in ((b'{', 'ADMISSION_JSON'), (b'[]', 'SOURCE_EVENT_OBJECT'),
+                          (b'{"number":1,"number":2}', 'ADMISSION_DUPLICATE_KEY')):
+            (self.root / 'event.json').write_bytes(raw)
+            with self.subTest(raw=raw), self.assertRaisesRegex(a.AdmissionError, '^' + code + '$'):
+                ci.source_identity()
+
+    def test_missing_event_file(self):
+        with patch.dict('os.environ', {'GITHUB_EVENT_PATH': str(self.root / 'missing.json')}):
+            self.reject('SOURCE_EVENT_FILE')
+
+    def test_one_parent_merge_rejected(self):
+        self.checkout(self.head)
+        self.reject('SOURCE_MERGE_PARENT_COUNT')
+
+    def test_zero_parent_merge_rejected(self):
+        self.checkout(self.base)
+        self.reject('SOURCE_MERGE_PARENT_COUNT')
+
+    def test_more_than_two_parents_rejected(self):
+        self.checkout(self.commit('octopus', self.base, self.head, self.extra))
+        self.reject('SOURCE_MERGE_PARENT_COUNT')
+
+    def test_reversed_parent_order_rejected(self):
+        self.checkout(self.commit('reversed', self.head, self.base))
+        self.reject('SOURCE_MERGE_PARENT_ORDER')
+
+    def test_base_parent_mismatch(self):
+        self.event['pull_request']['base']['sha'] = self.extra
+        self.reject('SOURCE_MERGE_PARENT_ORDER')
+
+    def test_head_parent_mismatch(self):
+        self.event['pull_request']['head']['sha'] = self.extra
+        self.reject('SOURCE_MERGE_PARENT_ORDER')
+
+    def test_unexpected_base_repository(self):
+        self.event['pull_request']['base']['repo']['id'] = 789
+        self.reject('SOURCE_PR_BASE_REPOSITORY')
+
+    def test_wrong_execution_repository(self):
+        for key, value in (('GITHUB_REPOSITORY', 'attacker/other'), ('GITHUB_REPOSITORY_ID', '789'),
+                           ('GITHUB_REPOSITORY_OWNER_ID', '789')):
+            with self.subTest(key=key), patch.dict('os.environ', {key: value}):
+                self.reject('SOURCE_REPOSITORY_CONTEXT')
+
+    def test_contradictory_head_repository(self):
+        original = copy.deepcopy(self.event)
+        for change, code in (({'id': 789}, 'SOURCE_PR_HEAD_REPOSITORY'),
+                             ({'full_name': 'attacker/other'}, 'SOURCE_REPOSITORY_IDENTITY'),
+                             ({'owner': {'login': 'Yeromenko-Kateryna', 'id': 789}}, 'SOURCE_PR_HEAD_OWNER')):
+            self.event = copy.deepcopy(original)
+            self.event['pull_request']['head']['repo'].update(change)
+            with self.subTest(change=change): self.reject(code)
+
+    def test_head_ref_label_and_user_cross_checks(self):
+        for value in ('attacker:codex/source-test', 'Yeromenko-Kateryna:other'):
+            self.event['pull_request']['head']['label'] = value
+            with self.subTest(label=value): self.reject('SOURCE_PR_BRANCH_CONTEXT')
+        self.event['pull_request']['head']['label'] = 'Yeromenko-Kateryna:codex/source-test'
+        self.event['pull_request']['head']['user'] = {'login': 'other', 'id': 789}
+        self.reject('SOURCE_PR_HEAD_USER')
+
+    def test_existing_fork_trigger_policy_requires_consistent_identity(self):
+        head = self.event['pull_request']['head']
+        head['repo'] = {'id': 789, 'name': 'fork', 'full_name': 'SyntheticOwner/fork',
+                        'owner': {'login': 'SyntheticOwner', 'id': 987}, 'fork': True}
+        head['label'] = 'SyntheticOwner:codex/source-test'
+        self.assertEqual(self.identity()['pr_head_sha'], self.head)
+        head['repo']['fork'] = False
+        self.reject('SOURCE_PR_HEAD_FORK')
+
+    def test_unavailable_parent_object(self):
+        missing = 'd' * 40
+        raw = (f'tree {self.tree}\nparent {self.base}\nparent {missing}\n'
+               'author Synthetic QA <qa@example.invalid> 1793880000 +0000\n'
+               'committer Synthetic QA <qa@example.invalid> 1793880000 +0000\n\nmissing parent\n').encode()
+        self.checkout(self.git('hash-object', '-t', 'commit', '-w', '--stdin', data=raw))
+        self.event['pull_request']['head']['sha'] = missing
+        self.reject('SOURCE_GIT_COMMAND')
+
+    def test_non_commit_head_object(self):
+        blob = self.git('hash-object', '-w', '--stdin', data=b'not a commit')
+        real_git = ci.source_git
+        def git_boundary(*args):
+            return blob if args == ('rev-parse', '--verify', 'HEAD') else real_git(*args)
+        with patch.object(ci, 'source_git', side_effect=git_boundary), patch.dict('os.environ', {'GITHUB_SHA': blob}):
+            self.reject('SOURCE_HEAD_OBJECT_TYPE')
+
+    def test_non_commit_parent_object(self):
+        blob = self.git('hash-object', '-w', '--stdin', data=b'not a parent commit')
+        raw = (f'tree {self.tree}\nparent {self.base}\nparent {blob}\n'
+               'author Synthetic QA <qa@example.invalid> 1793880000 +0000\n'
+               'committer Synthetic QA <qa@example.invalid> 1793880000 +0000\n\nbad parent type\n').encode()
+        self.checkout(self.git('hash-object', '-t', 'commit', '-w', '--stdin', data=raw))
+        self.event['pull_request']['head']['sha'] = blob
+        self.reject('SOURCE_PARENT_OBJECT_TYPE')
+
+    def test_git_command_nonzero_fails_closed(self):
+        with patch.object(ci.subprocess, 'check_output', side_effect=subprocess.CalledProcessError(128, 'git')):
+            self.reject('SOURCE_GIT_COMMAND')
+
+    def test_source_hash_changed_rejects_existing_launch(self):
+        source = self.identity()
+        launch = {'source_identity': source, 'head': self.merge, 'inputs': source['inputs'],
+                  'githubRun': '123', 'githubAttempt': '1'}
+        ci.validate_launch(launch)
+        (self.root / 'uv.lock').write_bytes(b'changed without updating expected hash')
+        with self.assertRaisesRegex(a.AdmissionError, '^SOURCE_MISMATCH$'):
+            ci.validate_launch(launch)
+
+    def test_unchanged_receipt_schema_and_corrupt_source_rejection(self):
+        source = self.identity()
+        value = unit(); value['source_identity'] = source
+        a.validate_unit(value, RUN, source)
+        value['source_identity'] = {**source, 'github_run_attempt': '2'}
+        with self.assertRaisesRegex(a.AdmissionError, '^SOURCE_MISMATCH$'):
+            a.validate_unit(value, RUN, source)
+
+    def test_publication_cannot_accept_failed_source_admission(self):
+        source = self.identity()
+        raw = self.root / 'raw'; raw.mkdir(exist_ok=True)
+        (raw / 'launch.json').write_bytes(encoded({'source_identity': source}))
+        temp = self.root / 'publisher'; temp.mkdir(exist_ok=True)
+        with patch.dict('os.environ', {'GITHUB_REF': 'refs/pull/4/merge', 'RUNNER_TEMP': str(temp),
+                                      'RG06D_RUN_OUTCOME': 'success'}), patch.object(ci, 'artifact', return_value=raw):
+            with self.assertRaisesRegex(ci.Stop, '^EVIDENCE_PUBLICATION_INCOMPLETE$'):
+                ci.publish()
+        published = a.parse((temp / 'rg06d-safe-123-1/publication-manifest.json').read_bytes())
+        self.assertIn('RAW_EVIDENCE_UNAVAILABLE', published['rejected'])
+        self.assertEqual(published['copied'], [])
+
+    def test_existing_push_and_dispatch_paths_are_explicit(self):
+        self.event = {'repository': self.event['repository'], 'ref': 'refs/heads/main',
+                      'after': self.merge, 'deleted': False}
+        context = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/main',
+                   'GITHUB_HEAD_REF': '', 'GITHUB_BASE_REF': ''}
+        with patch.dict('os.environ', context):
+            self.assertIsNone(self.identity()['tested_merge_sha'])
+        self.event['ref'] = 'main'
+        with patch.dict('os.environ', {**context, 'GITHUB_EVENT_NAME': 'workflow_dispatch'}):
+            self.assertIsNone(self.identity()['pr_head_sha'])
+            self.event['ref'] = 'other'
+            self.reject('SOURCE_DISPATCH_CONTEXT')
+
+    def test_real_depth_two_checkout_contains_parent_objects(self):
+        clone = self.root / 'depth-two'
+        result = subprocess.run(['git', 'clone', '--quiet', '--depth=2', '--no-checkout',
+                                 self.root.as_uri(), str(clone)], capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+        self.assertEqual(subprocess.check_output(['git', 'rev-parse', '--is-shallow-repository'],
+                                                cwd=clone).decode().strip(), 'true')
+        for name in ci.INPUTS:
+            target = clone / name; target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((self.root / name).read_bytes())
+        with patch.object(ci, 'ROOT', clone):
+            self.assertEqual(self.identity()['checkout_sha'], self.merge)
 
 
 if __name__ == '__main__':

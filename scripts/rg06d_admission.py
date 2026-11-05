@@ -60,6 +60,97 @@ SOURCE_KEYS = ('checkout_sha', 'pr_head_sha', 'pr_base_sha', 'tested_merge_sha',
                'github_run_id', 'github_run_attempt', 'inputs', 'python_lock_sha256', 'node_lock_sha256')
 
 
+OFFICIAL_REPOSITORY = 'Yeromenko-Kateryna/reqguard-quality-platform'
+
+
+def source_oid(value):
+    require(type(value) is str and re.fullmatch('[0-9a-f]{40}', value), 'SOURCE_COMMIT_OID')
+    return value
+
+
+def repository_identity(value):
+    require(type(value) is dict and type(value.get('owner')) is dict, 'SOURCE_REPOSITORY_FIELDS')
+    owner = value['owner']
+    require(type(owner.get('login')) is str and re.fullmatch('[A-Za-z0-9][A-Za-z0-9-]*', owner['login'])
+            and type(owner.get('id')) is int and owner['id'] > 0, 'SOURCE_REPOSITORY_OWNER')
+    require(type(value.get('name')) is str and re.fullmatch('[A-Za-z0-9_.-]+', value['name'])
+            and value.get('full_name') == owner['login'] + '/' + value['name']
+            and type(value.get('id')) is int and value['id'] > 0, 'SOURCE_REPOSITORY_IDENTITY')
+    return value['full_name'], value['id'], owner['login'], owner['id']
+
+
+def source_branch(value):
+    # Git branch names only, never revision expressions or command options.
+    require(type(value) is str and bool(value) and not value.startswith(('/', '-', '.'))
+            and not value.endswith(('/', '.')) and '..' not in value and '@{' not in value
+            and not re.search(r'[\x00-\x20\x7f~^:?*\[\\]', value)
+            and all(part and not part.startswith('.') and not part.endswith('.lock')
+                    for part in value.split('/')), 'SOURCE_BRANCH')
+    return value
+
+
+def validate_execution_context(head, event, env):
+    """Bind declarations to execution; caller separately verifies real Git objects.
+
+    PR merge_commit_sha is advisory only and intentionally not consumed. Forks
+    retain the existing PR trigger policy, with distinct, consistent repo IDs,
+    owner/label and head-ref bindings; no arbitrary repository is trusted as base.
+    """
+    source_oid(head)
+    require(head == source_oid(env.get('GITHUB_SHA')), 'CHECKOUT_EVENT_SHA')
+    require(type(event) is dict, 'SOURCE_EVENT_OBJECT')
+    official = repository_identity(event.get('repository'))
+    require(env.get('GITHUB_REPOSITORY') == official[0] == OFFICIAL_REPOSITORY
+            and env.get('GITHUB_REPOSITORY_ID') == str(official[1])
+            and env.get('GITHUB_REPOSITORY_OWNER') == official[2]
+            and env.get('GITHUB_REPOSITORY_OWNER_ID') == str(official[3]), 'SOURCE_REPOSITORY_CONTEXT')
+    kind = env.get('GITHUB_EVENT_NAME')
+    if kind == 'pull_request':
+        pr = event.get('pull_request')
+        require(type(pr) is dict, 'SOURCE_PR_FIELDS')
+        number = event.get('number')
+        require(type(number) is int and number > 0 and type(pr.get('number')) is int
+                and pr['number'] == number, 'SOURCE_PR_NUMBER')
+        require(env.get('GITHUB_REF') == f'refs/pull/{number}/merge', 'SOURCE_PR_REF')
+        for side, context in (('base', 'GITHUB_BASE_REF'), ('head', 'GITHUB_HEAD_REF')):
+            value = pr.get(side)
+            require(type(value) is dict, 'SOURCE_PR_FIELDS')
+            source_oid(value.get('sha'))
+            ref = source_branch(value.get('ref'))
+            identity = repository_identity(value.get('repo'))
+            require(env.get(context) == ref and value.get('label') == identity[2] + ':' + ref,
+                    'SOURCE_PR_BRANCH_CONTEXT')
+            if side == 'base':
+                require(identity == official, 'SOURCE_PR_BASE_REPOSITORY')
+            else:
+                # Same name must mean same stable ID and vice versa.
+                require((identity[0] == official[0]) == (identity[1] == official[1]),
+                        'SOURCE_PR_HEAD_REPOSITORY')
+                require((identity[2] == official[2]) == (identity[3] == official[3]),
+                        'SOURCE_PR_HEAD_OWNER')
+                if identity[0] == official[0]:
+                    require(identity == official, 'SOURCE_PR_HEAD_REPOSITORY')
+                else:
+                    require(value['repo'].get('fork') is True, 'SOURCE_PR_HEAD_FORK')
+                user = value.get('user')
+                if user is not None:
+                    require(type(user) is dict and user.get('login') == identity[2]
+                            and type(user.get('id')) is int and user['id'] == identity[3],
+                            'SOURCE_PR_HEAD_USER')
+        return pr
+    # Explicit paths already exposed by this workflow; all other events reject.
+    require(kind in ('push', 'workflow_dispatch'), 'SOURCE_EVENT_KIND')
+    require('pull_request' not in event and not env.get('GITHUB_HEAD_REF')
+            and not env.get('GITHUB_BASE_REF'), 'SOURCE_NON_PR_CONTEXT')
+    if kind == 'push':
+        require(env.get('GITHUB_REF') == event.get('ref') == 'refs/heads/main'
+                and event.get('after') == head and event.get('deleted') is False, 'SOURCE_PUSH_CONTEXT')
+    else:
+        ref = source_branch(event.get('ref'))
+        require(env.get('GITHUB_REF') == 'refs/heads/' + ref, 'SOURCE_DISPATCH_CONTEXT')
+    return None
+
+
 def validate_source(source, expected):
     shape(source, SOURCE_KEYS)
     require(source == expected, 'SOURCE_MISMATCH')

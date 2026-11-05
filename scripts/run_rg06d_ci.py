@@ -215,10 +215,35 @@ def output(argv):
                                    text=True, timeout=15).strip()
 
 
+def source_git(*args):
+    try:
+        return output(['git', '--no-replace-objects', *args])
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        raise Stop('SOURCE_GIT_COMMAND') from None
+
+
+def source_checkout():
+    head = source_git('rev-parse', '--verify', 'HEAD')
+    try:
+        event = admission.parse(Path(os.environ['GITHUB_EVENT_PATH']).read_bytes())
+    except (KeyError, OSError):
+        raise Stop('SOURCE_EVENT_FILE') from None
+    pr = admission.validate_execution_context(head, event, os.environ)
+    require(source_git('cat-file', '-t', head) == 'commit', 'SOURCE_HEAD_OBJECT_TYPE')
+    if pr is not None:
+        # Raw object headers retain parent order even in a shallow checkout.
+        headers = source_git('cat-file', 'commit', head).split('\n\n', 1)[0].splitlines()
+        parents = [line[7:] for line in headers if line.startswith('parent ')]
+        require(len(parents) == 2, 'SOURCE_MERGE_PARENT_COUNT')
+        require(parents == [pr['base']['sha'], pr['head']['sha']], 'SOURCE_MERGE_PARENT_ORDER')
+        for parent in parents:
+            admission.source_oid(parent)
+            require(source_git('cat-file', '-t', parent) == 'commit', 'SOURCE_PARENT_OBJECT_TYPE')
+    return head, pr
+
+
 def source_identity():
-    head = output(['git', 'rev-parse', 'HEAD'])
-    event = admission.parse(Path(os.environ['GITHUB_EVENT_PATH']).read_bytes())
-    pr = event.get('pull_request') if os.environ['GITHUB_EVENT_NAME'] == 'pull_request' else None
+    head, pr = source_checkout()
     hashes = {n: digest(ROOT / n) for n in INPUTS}
     value = {'checkout_sha': head, 'pr_head_sha': pr['head']['sha'] if pr else None,
              'pr_base_sha': pr['base']['sha'] if pr else None,
@@ -228,9 +253,6 @@ def source_identity():
              'python_lock_sha256': hashes['uv.lock'],
              'node_lock_sha256': hashes['quality/browser/package-lock.json']}
     admission.validate_source(value, value)
-    require(head == os.environ['GITHUB_SHA'], 'CHECKOUT_EVENT_SHA')
-    if pr:
-        require(pr.get('merge_commit_sha') == head, 'PR_MERGE_SHA')
     return value
 
 
