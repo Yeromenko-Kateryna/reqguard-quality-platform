@@ -5,6 +5,7 @@ Read-only Docker admission only: GitHub owns service disposal, which this file c
 """
 
 import ctypes
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 import stat
 import hashlib
@@ -418,15 +419,80 @@ def no_descendants(summary):
     summary['descendantsExited'] = False
 
 
+class RuntimeFailure:
+    """Small stage cursor; failure diagnostics never confer acceptance."""
+    def __init__(self, path):
+        self.path = path
+        self.source = None
+        self.index = 0
+        self.first = None
+
+    def completed(self, stage):
+        require(self.first is None and admission.DIAGNOSTIC_STAGES[self.index] == stage,
+                'DIAGNOSTIC_TRANSITION')
+        self.index += 1
+
+    def save(self):
+        try:
+            identity, reference = admission.diagnostic_binding(self.path.name, self.source)
+            value = {**self.first, 'schema_version': 'rg06d-failure-diagnostic-v1',
+                     'run_identity': identity, 'source_identity_reference': reference}
+            raw = (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode('ascii')
+            admission.atomic_failure(self.path, raw, self.path.name, self.source)
+        except Exception:
+            print('DIAGNOSTIC_UNAVAILABLE')
+
+    def failed(self, error):
+        if self.first is not None:
+            return
+        stage = admission.DIAGNOSTIC_STAGES[self.index]
+        code = 'EXECUTION_EXCEPTION'
+        if isinstance(error, Stop) and str(error) in admission.DIAGNOSTIC_CODES[stage]:
+            code = str(error)
+        elif isinstance(error, admission.AdmissionError):
+            code = 'ADMISSION_REJECTED'
+        self.first = {'last_completed_runtime_stage': admission.DIAGNOSTIC_STAGES[self.index - 1]
+                      if self.index else 'NONE', 'first_failed_runtime_stage': stage,
+                      'allowlisted_failure_code': code, 'cleanup_status': 'PENDING'}
+        self.save()
+
+    def cleanup(self, server_receipt, test_receipt, summary, raised):
+        if self.first is None:
+            return
+        complete = (not raised and summary.get('descendantsExited') is True
+                    and all(not r['started'] or (r['exited'] and not r['forced']
+                            and not r.get('terminationUnknown')) for r in (server_receipt, test_receipt))
+                    and (not server_receipt['started'] or server_receipt.get('gracefulShutdown') is True))
+        self.first['cleanup_status'] = 'COMPLETED' if complete else 'FAILED_OR_UNVERIFIED'
+        self.save()
+
+
+@contextmanager
+def diagnostic_cleanup(tracker, server_receipt, test_receipt, summary):
+    try:
+        yield
+    except BaseException as error:
+        tracker.failed(error)
+        raise
+    finally:
+        tracker.cleanup(server_receipt, test_receipt, summary, sys.exc_info()[0] is not None)
+
+
 def run_tests():
-    path = artifact()
+    try:
+        path = artifact()
+    except Exception:
+        print('DIAGNOSTIC_UNAVAILABLE')
+        raise
     server = playwright = None
     server_receipt = {'started': False, 'exited': False, 'forced': False}
     test_receipt = {'started': False, 'exited': False, 'forced': False}
     summary = {'state': 'FAIL', 'run': path.name, 'sqlCleanup': 'NOT_VERIFIED',
                'serviceDisposal': 'GITHUB_MANAGED_NOT_ATTESTED_BY_HARNESS'}
     streams = []
+    failure = RuntimeFailure(path)
     try:
+        failure.source = source_identity()
         require(sys.platform == 'linux' and sys.version_info[:3] == (3, 12, 10)
                 and os.environ.get('GITHUB_ACTIONS') == 'true', 'LINUX_PYTHON_VERSION')
         prctl = ctypes.CDLL(None, use_errno=True).prctl
@@ -435,11 +501,15 @@ def run_tests():
         require(output(['node', '--version']) == 'v24.15.0', 'NODE_VERSION')
         require(output(['npm', '--version']) == '11.12.1', 'NPM_VERSION')
         require(output(['uv', 'self', 'version', '--short']) == '0.11.22', 'UV_VERSION')
+        failure.completed('EARLY_CHECKS')
         launch = admission.parse(admission.read(path, 'launch.json'))
         source = validate_launch(launch)
         require(all(digest(ROOT / n) == h for n, h in launch['inputs'].items()), 'SOURCE_OR_LOCK_CHANGED')
+        failure.completed('SOURCE_INTEGRITY')
         unit_gate(path, source)
+        failure.completed('OWNERSHIP_UNIT')
         preload_gate(path, source)
+        failure.completed('PG_PRELOAD')
         locked = {p['name']: p['version'] for p in tomllib.loads((ROOT / 'uv.lock').read_text())['package']}
         runtime = {n: importlib.metadata.version(n) for n in
                    ('fastapi', 'psycopg', 'psycopg-binary', 'uvicorn', 'pydantic', 'starlette')}
@@ -456,6 +526,7 @@ def run_tests():
         cache = Path(os.environ['PLAYWRIGHT_BROWSERS_PATH']).resolve(strict=True)
         require(browser.is_file() and browser.resolve().is_relative_to(cache)
                 and 'chromium-1248' in browser.parts, 'CHROMIUM_BOUNDARY')
+        failure.completed('RUNTIME_PACKAGES')
         port = os.environ['RG06B_DB_PORT']
         require(port.isdigit() and 1024 <= int(port) <= 65535, 'DB_PORT')
         require(os.environ['RG06D_DB_PASSWORD'] == PASSWORD, 'CI_SERVICE_CREDENTIAL')
@@ -476,6 +547,7 @@ def run_tests():
         write(path / 'postgres-ready.json', {'database': identity[0], 'role': identity[1],
               'serverVersionNum': identity[2], 'freshSchemaCommitted': True,
               'pythonPackages': runtime, 'chromiumSha256': digest(browser)})
+        failure.completed('POSTGRESQL_ADMISSION')
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             api_port = sock.getsockname()[1]
@@ -507,6 +579,7 @@ def run_tests():
         server_receipt['ready'] = True
         require(not env.get('NODE_OPTIONS'), 'AMBIENT_NODE_OPTIONS')
         env.update(RG06D_NODE_IDENTITY='1', NODE_OPTIONS='--import=' + (PACKAGE / 'ci-identity.mjs').as_uri())
+        failure.completed('API_SERVER')
         playwright = subprocess.Popen(['node', str(PACKAGE / 'node_modules/playwright/cli.js'),
                                        'test', '--config', str(PACKAGE / 'playwright.ci.config.ts'),
                                        '--project=chromium'], cwd=ROOT, env=env,
@@ -534,6 +607,7 @@ def run_tests():
                 and s['tests'][0]['projectName'] == 'chromium' and s['tests'][0]['status'] == 'expected'
                 and len(s['tests'][0]['results']) == 1 and s['tests'][0]['results'][0]['status'] == 'passed'
                 and s['tests'][0]['results'][0]['retry'] == 0 for s in specs), 'EXACT_THREE_RESULTS')
+        failure.completed('CHROMIUM')
         validate_unsupported_receipts(read_unsupported_receipts(path), path.name)
         connections = [admission.parse(admission.read(path, p.name)) for p in sorted(path.glob('connection-*.json'))]
         write(path / 'connections.json', {'schema_version': 'rg06d-connections-v1', 'run_id': path.name,
@@ -541,37 +615,59 @@ def run_tests():
         validate_launch(admission.parse(admission.read(path, 'launch.json')))
         validate_admission_bundle(path, source, path.name)
         summary.update(tests=report['stats'], sqlCleanup='VERIFIED', assertions='PASS')
+        failure.completed('EVIDENCE_VALIDATION')
     except BaseException as error:
+        failure.failed(error)
         summary['reason'] = str(error) if isinstance(error, Stop) else 'EXECUTION_' + type(error).__name__
     finally:
-        for process, receipt in [(playwright, test_receipt), (server, server_receipt)]:
-            try:
-                stop_process(process, receipt)
-            except BaseException:
-                receipt['terminationUnknown'] = True
-        if server is not None:
-            server_receipt['finishedAt'] = time.time()
-        no_descendants(summary)
-        for stream in streams:
-            stream.close()
-        # Uvicorn re-raises a handled SIGTERM after graceful lifespan shutdown.
-        server_log = (path / 'uvicorn.stderr').read_text(errors='replace') if streams else ''
-        server_receipt['gracefulShutdown'] = (
-            server_receipt.get('terminationRequested') is True
-            and server_receipt.get('exit') in (0, -signal.SIGTERM)
-            and 'Application shutdown complete.' in server_log
-            and 'Finished server process' in server_log)
-        clean = (summary.get('assertions') == 'PASS' and server_receipt['gracefulShutdown']
-                 and all(r['exited'] and not r['forced'] and not r.get('terminationUnknown')
-                         for r in (server_receipt, test_receipt)) and summary['descendantsExited'])
-        summary['state'] = 'PASS' if clean else 'FAIL'
-        if not clean:
-            summary.setdefault('reason', 'PROCESS_CLEANUP_NOT_VERIFIED')
-        write(path / 'server-process.json', server_receipt)
-        write(path / 'playwright-process.json', test_receipt)
-        write(path / 'run-summary.json', summary)
+        with diagnostic_cleanup(failure, server_receipt, test_receipt, summary):
+            for process, receipt in [(playwright, test_receipt), (server, server_receipt)]:
+                try:
+                    stop_process(process, receipt)
+                except BaseException:
+                    receipt['terminationUnknown'] = True
+            if server is not None:
+                server_receipt['finishedAt'] = time.time()
+            no_descendants(summary)
+            for stream in streams:
+                stream.close()
+            # Uvicorn re-raises a handled SIGTERM after graceful lifespan shutdown.
+            server_log = (path / 'uvicorn.stderr').read_text(errors='replace') if streams else ''
+            server_receipt['gracefulShutdown'] = (
+                server_receipt.get('terminationRequested') is True
+                and server_receipt.get('exit') in (0, -signal.SIGTERM)
+                and 'Application shutdown complete.' in server_log
+                and 'Finished server process' in server_log)
+            clean = (summary.get('assertions') == 'PASS' and server_receipt['gracefulShutdown']
+                     and all(r['exited'] and not r['forced'] and not r.get('terminationUnknown')
+                             for r in (server_receipt, test_receipt)) and summary['descendantsExited'])
+            summary['state'] = 'PASS' if clean else 'FAIL'
+            if not clean:
+                failure.failed(Stop('PROCESS_CLEANUP_NOT_VERIFIED'))
+                summary.setdefault('reason', 'PROCESS_CLEANUP_NOT_VERIFIED')
+            write(path / 'server-process.json', server_receipt)
+            write(path / 'playwright-process.json', test_receipt)
+            write(path / 'run-summary.json', summary)
     print('RG06D ' + summary['state'] + '; run=' + path.name)
     return 0 if summary['state'] == 'PASS' else 1
+
+
+def publish_failure(raw, safe, publication):
+    """Independent source-bound diagnostic path, never part of copied acceptance."""
+    target = safe / admission.DIAGNOSTIC_NAME
+    try:
+        require(publication['runOutcome'] == 'failure', 'DIAGNOSTIC_CONTEXT')
+        source = source_identity()
+        original = admission.read_failure(raw, raw.name, source)
+        admission.atomic_failure(safe, original, raw.name, source)
+        require(admission.read_failure(safe, raw.name, source) == original, 'DIAGNOSTIC_COPY_CHANGED')
+        require(admission.read_failure(raw, raw.name, source) == original, 'DIAGNOSTIC_RAW_CHANGED')
+        publication['diagnosticPublication'] = 'PUBLISHED'
+    except Exception:
+        # safe is newly created; remove only this diagnostic copy, never raw files.
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        publication['diagnosticPublication'] = 'DIAGNOSTIC_UNAVAILABLE'
 
 
 def publish():
@@ -584,11 +680,14 @@ def publish():
                    'dependencyOutcome': os.environ.get('RG06D_DEPENDENCY_OUTCOME', 'unknown'),
                    'serviceDisposal': 'GITHUB_MANAGED_NOT_ATTESTED_BY_HARNESS',
                    'copied': [], 'rejected': [], 'binaryDiagnostics': 'NOT_PUBLISHED',
+                   'diagnosticPublication': 'DIAGNOSTIC_UNAVAILABLE',
                    'note': 'Only allowlisted JSON and redacted text; no profiles, temp, traces or screenshots.'}
     # Write safe fallback evidence even if setup never reached the harness.
     write(safe / 'publication-context.json', publication)
     try:
         raw = artifact()
+        if publication['runOutcome'] == 'failure':
+            publish_failure(raw, safe, publication)
         source = validate_launch(admission.parse(admission.read(raw, 'launch.json')))
         admission_bytes = validate_admission_bundle(raw, source, raw.name)
         receipt_bytes = {}

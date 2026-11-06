@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import io
 import os
 import re
 from pathlib import Path
@@ -10,7 +11,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import rg06d_admission as a
 import run_rg06d_ci as ci
@@ -774,6 +775,259 @@ class MergeCheckoutTests(unittest.TestCase):
             target.write_bytes((self.root / name).read_bytes())
         with patch.object(ci, 'ROOT', clone):
             self.assertEqual(self.identity()['checkout_sha'], self.merge)
+
+
+class FailureDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='rg06d-failure-')
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.raw = self.directory / RUN; self.raw.mkdir()
+
+    def diagnostic(self, stage='EARLY_CHECKS', code='NODE_VERSION'):
+        tracker = ci.RuntimeFailure(self.raw); tracker.source = copy.deepcopy(SOURCE)
+        for completed in a.DIAGNOSTIC_STAGES[:a.DIAGNOSTIC_STAGES.index(stage)]:
+            tracker.completed(completed)
+        tracker.failed(ci.Stop(code))
+        return tracker, a.read_failure(self.raw, RUN, SOURCE)
+
+    def test_early_capture_through_actual_run_tests(self):
+        # Actual harness stops before platform-specific primitives, sockets or drivers.
+        with patch.object(ci, 'artifact', return_value=self.raw), \
+             patch.object(ci, 'source_identity', return_value=SOURCE), \
+             patch.object(ci.sys, 'platform', 'synthetic-platform'), \
+             patch.object(ci, 'no_descendants', side_effect=lambda s: s.update(descendantsExited=True)), \
+             patch.object(ci, 'unit_gate') as units:
+            self.assertEqual(ci.run_tests(), 1)
+            units.assert_not_called()
+        value = a.validate_failure(a.read_failure(self.raw, RUN, SOURCE), RUN, SOURCE)
+        self.assertEqual(value['first_failed_runtime_stage'], 'EARLY_CHECKS')
+        self.assertEqual(value['allowlisted_failure_code'], 'LINUX_PYTHON_VERSION')
+        self.assertEqual(value['cleanup_status'], 'COMPLETED')
+
+    def test_real_preload_gate_failure_through_actual_run_tests(self):
+        a.write(self.raw, 'launch.json', {'inputs': {}})
+        prctl = MagicMock(return_value=0)
+        versions = {'node': 'v24.15.0', 'npm': '11.12.1', 'uv': '0.11.22'}
+        # Fail at the real required-mode guard, without installing/resolving pg.
+        with patch.object(ci, 'artifact', return_value=self.raw), \
+             patch.object(ci, 'source_identity', return_value=SOURCE), \
+             patch.object(ci, 'validate_launch', return_value=SOURCE), \
+             patch.object(ci.sys, 'platform', 'linux'), patch.object(ci.sys, 'version_info', (3, 12, 10)), \
+             patch.dict('os.environ', {'GITHUB_ACTIONS': 'true', 'RG06D_REQUIRE_PG_PRELOAD_TEST': '0'}), \
+             patch.object(ci.ctypes, 'CDLL', return_value=SimpleNamespace(prctl=prctl)), \
+             patch.object(ci, 'output', side_effect=lambda argv: versions[argv[0]]), \
+             patch.object(ci, 'unit_gate'), \
+             patch.object(ci, 'no_descendants', side_effect=lambda s: s.update(descendantsExited=True)):
+            self.assertEqual(ci.run_tests(), 1)
+        value = a.validate_failure(a.read_failure(self.raw, RUN, SOURCE), RUN, SOURCE)
+        self.assertEqual(value['first_failed_runtime_stage'], 'PG_PRELOAD')
+        self.assertEqual(value['allowlisted_failure_code'], 'PRELOAD_REQUIRED_MODE')
+        self.assertEqual(value['last_completed_runtime_stage'], 'OWNERSHIP_UNIT')
+
+    def test_failure_before_postgresql(self):
+        _, raw = self.diagnostic('RUNTIME_PACKAGES', 'PYTHON_LOCK_MISMATCH')
+        value = a.validate_failure(raw, RUN, SOURCE)
+        self.assertEqual(value['first_failed_runtime_stage'], 'RUNTIME_PACKAGES')
+        self.assertEqual(value['last_completed_runtime_stage'], 'PG_PRELOAD')
+
+    def test_failure_before_chromium(self):
+        _, raw = self.diagnostic('API_SERVER', 'SERVER_READINESS_TIMEOUT')
+        value = a.validate_failure(raw, RUN, SOURCE)
+        self.assertEqual(value['first_failed_runtime_stage'], 'API_SERVER')
+        self.assertEqual(value['last_completed_runtime_stage'], 'POSTGRESQL_ADMISSION')
+
+    def test_primary_failure_survives_cleanup_exception(self):
+        tracker, original = self.diagnostic('PG_PRELOAD', 'PRELOAD_PG_MISSING')
+        receipt = {'started': False, 'exited': False, 'forced': False}
+        with self.assertRaisesRegex(RuntimeError, 'secret cleanup text'):
+            with ci.diagnostic_cleanup(tracker, receipt, receipt, {}):
+                raise RuntimeError('secret cleanup text')
+        value = a.validate_failure(a.read_failure(self.raw, RUN, SOURCE), RUN, SOURCE)
+        old = a.validate_failure(original, RUN, SOURCE)
+        self.assertEqual({k: v for k, v in value.items() if k != 'cleanup_status'},
+                         {k: v for k, v in old.items() if k != 'cleanup_status'})
+        self.assertEqual(value['cleanup_status'], 'FAILED_OR_UNVERIFIED')
+
+    def test_cleanup_only_failure_is_bound_to_cleanup_stage(self):
+        tracker = ci.RuntimeFailure(self.raw); tracker.source = SOURCE
+        for stage in a.DIAGNOSTIC_STAGES[:-1]: tracker.completed(stage)
+        tracker.failed(ci.Stop('PROCESS_CLEANUP_NOT_VERIFIED'))
+        value = a.validate_failure(a.read_failure(self.raw, RUN, SOURCE), RUN, SOURCE)
+        self.assertEqual(value['first_failed_runtime_stage'], 'PROCESS_CLEANUP')
+
+    def test_malformed_truncated_duplicate_and_nonfinite_json(self):
+        for raw in (b'', b'{', b'{"x":1,"x":2}', b'{"x":NaN}', b'[]'):
+            with self.subTest(raw=raw), self.assertRaises(a.AdmissionError):
+                a.validate_failure(raw, RUN, SOURCE)
+
+    def test_exact_top_level_and_nested_fields_and_types(self):
+        _, raw = self.diagnostic(); original = a.validate_failure(raw, RUN, SOURCE)
+        mutations = [lambda d: d.update(extra='unexpected'), lambda d: d.pop('cleanup_status'),
+                     lambda d: d.update(schema_version='unsupported'),
+                     lambda d: d.update(run_identity=[]),
+                     lambda d: d['run_identity'].update(extra='unexpected'),
+                     lambda d: d['source_identity_reference'].update(extra='unexpected'),
+                     lambda d: d.update(first_failed_runtime_stage=True),
+                     lambda d: d['run_identity'].update(github_run_attempt=1)]
+        for mutate in mutations:
+            value = copy.deepcopy(original); mutate(value)
+            with self.subTest(mutation=mutations.index(mutate)), self.assertRaises(a.AdmissionError):
+                a.validate_failure(encoded(value), RUN, SOURCE)
+
+    def test_payload_and_individual_string_limits(self):
+        _, raw = self.diagnostic()
+        with self.assertRaises(a.AdmissionError): a.validate_failure(raw + b' ' * 2048, RUN, SOURCE)
+        value = a.validate_failure(raw, RUN, SOURCE); value['allowlisted_failure_code'] = 'x' * 65
+        with self.assertRaises(a.AdmissionError): a.validate_failure(encoded(value), RUN, SOURCE)
+
+    def test_unavailable_source_or_atomic_write_reports_fixed_status_only(self):
+        tracker = ci.RuntimeFailure(self.raw)
+        with patch('sys.stdout', new_callable=io.StringIO) as output:
+            tracker.failed(RuntimeError('Bearer secret must not escape'))
+        self.assertEqual(output.getvalue(), 'DIAGNOSTIC_UNAVAILABLE\n')
+        self.assertFalse((self.raw / a.DIAGNOSTIC_NAME).exists())
+        tracker = ci.RuntimeFailure(self.raw); tracker.source = SOURCE
+        with patch.object(a.os, 'replace', side_effect=OSError('secret filesystem detail')), \
+             patch('sys.stdout', new_callable=io.StringIO) as output:
+            tracker.failed(ci.Stop('NODE_VERSION'))
+        self.assertEqual(output.getvalue(), 'DIAGNOSTIC_UNAVAILABLE\n')
+        self.assertFalse((self.raw / a.DIAGNOSTIC_NAME).exists())
+
+    def test_stage_order_code_and_cleanup_allowlists(self):
+        _, raw = self.diagnostic(); original = a.validate_failure(raw, RUN, SOURCE)
+        for key, change in (('first_failed_runtime_stage', 'UNRECOGNIZED'),
+                            ('last_completed_runtime_stage', 'CHROMIUM'),
+                            ('last_completed_runtime_stage', 'EARLY_CHECKS'),
+                            ('allowlisted_failure_code', 'DB_NOT_FRESH'),
+                            ('cleanup_status', 'ALL_FINE')):
+            value = copy.deepcopy(original); value[key] = change
+            with self.subTest(key=key, change=change), self.assertRaises(a.AdmissionError):
+                a.validate_failure(encoded(value), RUN, SOURCE)
+
+    def test_run_attempt_execution_and_source_mismatches(self):
+        _, raw = self.diagnostic(); original = a.validate_failure(raw, RUN, SOURCE)
+        for field, key, change in (('run_identity', 'github_run_id', '999'),
+                                  ('run_identity', 'github_run_attempt', '2'),
+                                  ('run_identity', 'execution_id', 'e' * 32),
+                                  ('source_identity_reference', 'checkout_sha', 'e' * 40),
+                                  ('source_identity_reference', 'source_identity_sha256', 'e' * 64)):
+            value = copy.deepcopy(original); value[field][key] = change
+            with self.subTest(key=key), self.assertRaises(a.AdmissionError):
+                a.validate_failure(encoded(value), RUN, SOURCE)
+        with self.assertRaises(a.AdmissionError):
+            a.validate_failure(raw, RUN, {**SOURCE, 'github_run_attempt': '2'})
+
+    def test_privacy_injection_is_rejected_in_every_diagnostic_slot(self):
+        _, raw = self.diagnostic(); original = a.validate_failure(raw, RUN, SOURCE)
+        for text in ('postgresql://owner:secret@host/db', 'Bearer synthetic-secret',
+                     'TOKEN=synthetic-secret', 'arbitrary exception message'):
+            for field in ('allowlisted_failure_code', 'first_failed_runtime_stage', 'cleanup_status'):
+                value = copy.deepcopy(original); value[field] = text
+                with self.subTest(text=text, field=field), self.assertRaises(a.AdmissionError):
+                    a.validate_failure(encoded(value), RUN, SOURCE)
+
+    def test_arbitrary_exception_is_mapped_without_message_or_class(self):
+        tracker = ci.RuntimeFailure(self.raw); tracker.source = SOURCE
+        tracker.failed(RuntimeError('postgresql://owner:secret@host/db'))
+        raw = a.read_failure(self.raw, RUN, SOURCE)
+        self.assertNotIn(b'owner', raw); self.assertNotIn(b'RuntimeError', raw)
+        self.assertEqual(a.validate_failure(raw, RUN, SOURCE)['allowlisted_failure_code'], 'EXECUTION_EXCEPTION')
+
+    def test_symlink_and_traversal_paths_rejected(self):
+        _, raw = self.diagnostic()
+        with patch.object(Path, 'is_symlink', return_value=True), self.assertRaises(a.AdmissionError):
+            a.read_failure(self.raw, RUN, SOURCE)
+        with self.assertRaises(a.AdmissionError):
+            a.atomic_failure(self.raw / '..' / RUN, raw, RUN, SOURCE)
+
+    def test_atomic_replace_interruption_leaves_no_partial_final(self):
+        tracker, raw = self.diagnostic()
+        second = self.directory / ('e' * 32); second.mkdir()
+        value = a.validate_failure(raw, RUN, SOURCE); value['run_identity']['execution_id'] = second.name
+        with patch.object(a.os, 'replace', side_effect=OSError('interrupted')):
+            with self.assertRaises(OSError): a.atomic_failure(second, encoded(value), second.name, SOURCE)
+        self.assertFalse((second / a.DIAGNOSTIC_NAME).exists())
+        self.assertEqual(list(second.iterdir()), [])
+
+    def test_atomic_cleanup_update_retains_prior_complete_json_on_failure(self):
+        tracker, before = self.diagnostic()
+        value = a.validate_failure(before, RUN, SOURCE); value['cleanup_status'] = 'COMPLETED'
+        with patch.object(a.os, 'replace', side_effect=OSError('interrupted')):
+            with self.assertRaises(OSError): a.atomic_failure(self.raw, encoded(value), RUN, SOURCE)
+        self.assertEqual(a.read_failure(self.raw, RUN, SOURCE), before)
+
+    def test_atomic_writer_rejects_primary_failure_replacement(self):
+        _, raw = self.diagnostic(); value = a.validate_failure(raw, RUN, SOURCE)
+        value['allowlisted_failure_code'] = 'NPM_VERSION'
+        with self.assertRaisesRegex(a.AdmissionError, 'DIAGNOSTIC_FIRST_FAILURE'):
+            a.atomic_failure(self.raw, encoded(value), RUN, SOURCE)
+
+    def publication(self, outcome='failure'):
+        env = {**ENV, 'RUNNER_TEMP': str(self.directory), 'RG06D_RUN_OUTCOME': outcome}
+        with patch.dict('os.environ', env), patch.object(ci, 'artifact', return_value=self.raw), \
+             patch.object(ci, 'source_identity', return_value=SOURCE):
+            with self.assertRaisesRegex(ci.Stop, '^EVIDENCE_PUBLICATION_INCOMPLETE$'): ci.publish()
+        return self.directory / 'rg06d-safe-123-1'
+
+    def test_valid_diagnostic_published_without_acceptance_bundle(self):
+        _, original = self.diagnostic('PG_PRELOAD', 'PRELOAD_PG_MISSING')
+        safe = self.publication()
+        self.assertEqual(a.read_failure(safe, RUN, SOURCE), original)
+        manifest = a.parse(a.read(safe, 'publication-manifest.json'))
+        self.assertEqual(manifest['diagnosticPublication'], 'PUBLISHED')
+        self.assertEqual(manifest['copied'], [])
+        self.assertIn('RAW_EVIDENCE_UNAVAILABLE', manifest['rejected'])
+        self.assertIn(a.DIAGNOSTIC_NAME, manifest['files'])
+
+    def test_missing_diagnostic_is_unavailable_without_fabrication(self):
+        safe = self.publication()
+        manifest = a.parse(a.read(safe, 'publication-manifest.json'))
+        self.assertEqual(manifest['diagnosticPublication'], 'DIAGNOSTIC_UNAVAILABLE')
+        self.assertFalse((safe / a.DIAGNOSTIC_NAME).exists())
+
+    def test_invalid_diagnostic_is_not_copied(self):
+        (self.raw / a.DIAGNOSTIC_NAME).write_bytes(b'{"token":"synthetic-secret"}')
+        safe = self.publication()
+        self.assertFalse((safe / a.DIAGNOSTIC_NAME).exists())
+        self.assertEqual(a.parse(a.read(safe, 'publication-manifest.json'))['diagnosticPublication'], 'DIAGNOSTIC_UNAVAILABLE')
+
+    def test_corruption_after_safe_copy_is_rejected_and_removed(self):
+        self.diagnostic(); real = a.atomic_failure
+        def corrupt(directory, raw, run, source):
+            real(directory, raw, run, source)
+            if directory != self.raw: (directory / a.DIAGNOSTIC_NAME).write_bytes(b'{')
+        with patch.object(a, 'atomic_failure', side_effect=corrupt): safe = self.publication()
+        self.assertFalse((safe / a.DIAGNOSTIC_NAME).exists())
+        self.assertEqual(a.parse(a.read(safe, 'publication-manifest.json'))['diagnosticPublication'], 'DIAGNOSTIC_UNAVAILABLE')
+
+    def test_runtime_pass_with_diagnostic_only_cannot_publish_acceptance(self):
+        self.diagnostic(); safe = self.publication(outcome='success')
+        manifest = a.parse(a.read(safe, 'publication-manifest.json'))
+        self.assertEqual(manifest['copied'], [])
+        self.assertTrue(manifest['rejected'])
+
+    def test_missing_ownership_or_preload_cannot_be_replaced_by_diagnostic(self):
+        self.diagnostic(); bundle(self.raw)
+        (self.raw / 'pg-preload.json').unlink()
+        with patch.object(ci, 'validate_launch', return_value=SOURCE):
+            a.write(self.raw, 'launch.json', {})
+            safe = self.publication()
+        self.assertEqual(a.parse(a.read(safe, 'publication-manifest.json'))['copied'], [])
+        self.assertTrue((safe / a.DIAGNOSTIC_NAME).exists())
+
+    def test_final_workflow_gate_rejects_runtime_fail_even_if_diagnostic_uploaded(self):
+        workflow = (ci.ROOT / '.github/workflows/rg06d-e2e.yml').read_text()
+        script = workflow.split('      - name: Require execution and evidence publication')[1].split('        run: |\n')[1]
+        script = '\n'.join(line[10:] for line in script.splitlines())
+        bash = str(Path(shutil.which('git')).parents[1] / 'bin/bash.exe') if os.name == 'nt' else shutil.which('bash')
+        for runtime, publish, expected in (('failure', 'success', 1), ('failure', 'failure', 1),
+                                           ('success', 'failure', 1), ('success', 'success', 0)):
+            with self.subTest(runtime=runtime, publish=publish):
+                result = subprocess.run([bash, '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script],
+                                        env={**os.environ, 'RUN_OUTCOME': runtime, 'PUBLISH_OUTCOME': publish,
+                                             'UPLOAD_OUTCOME': 'success', 'ARTIFACT_ID': '123'}, capture_output=True)
+                self.assertEqual(result.returncode, expected, result.stderr.decode(errors='replace'))
 
 
 if __name__ == '__main__':

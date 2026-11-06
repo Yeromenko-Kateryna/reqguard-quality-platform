@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import tempfile
 
 
 class AdmissionError(Exception):
@@ -66,6 +67,111 @@ OFFICIAL_REPOSITORY = 'Yeromenko-Kateryna/reqguard-quality-platform'
 def source_oid(value):
     require(type(value) is str and re.fullmatch('[0-9a-f]{40}', value), 'SOURCE_COMMIT_OID')
     return value
+
+
+DIAGNOSTIC_NAME = 'failure-diagnostic.json'
+DIAGNOSTIC_LIMIT = 2048
+DIAGNOSTIC_STAGES = ('EARLY_CHECKS', 'SOURCE_INTEGRITY', 'OWNERSHIP_UNIT', 'PG_PRELOAD',
+                     'RUNTIME_PACKAGES', 'POSTGRESQL_ADMISSION', 'API_SERVER', 'CHROMIUM',
+                     'EVIDENCE_VALIDATION', 'PROCESS_CLEANUP')
+DIAGNOSTIC_CLEANUP = ('PENDING', 'COMPLETED', 'FAILED_OR_UNVERIFIED')
+DIAGNOSTIC_CODES = {
+    'EARLY_CHECKS': ('LINUX_PYTHON_VERSION', 'SUBREAPER_UNAVAILABLE', 'NODE_VERSION', 'NPM_VERSION', 'UV_VERSION'),
+    'SOURCE_INTEGRITY': ('SOURCE_OR_LOCK_CHANGED',),
+    'OWNERSHIP_UNIT': (),
+    'PG_PRELOAD': ('PRELOAD_REQUIRED_MODE', 'PRELOAD_PG_MISSING', 'PRELOAD_PG_VERSION'),
+    'RUNTIME_PACKAGES': ('PYTHON_LOCK_MISMATCH', 'NODE_PACKAGE_VERSION', 'CHROMIUM_REVISION', 'CHROMIUM_BOUNDARY'),
+    'POSTGRESQL_ADMISSION': ('DB_PORT', 'CI_SERVICE_CREDENTIAL', 'HOSTED_RUNNER_REQUIRED', 'DOCKER_OVERRIDE',
+                             'JOB_DOCKER_ENDPOINT', 'ENGINE_ID', 'SERVICE_ID', 'SERVICE_IMAGE_DIGEST',
+                             'DB_IDENTITY', 'DB_NOT_FRESH', 'DB_NOT_EMPTY'),
+    'API_SERVER': ('PORT_COLLISION', 'SERVER_EXIT_BEFORE_READY', 'SERVER_READINESS_TIMEOUT', 'AMBIENT_NODE_OPTIONS'),
+    'CHROMIUM': ('PLAYWRIGHT_OR_SERVER_FAILED', 'EXACT_THREE_SCENARIOS', 'EXACT_THREE_RESULTS'),
+    'EVIDENCE_VALIDATION': (),
+    'PROCESS_CLEANUP': ('PROCESS_CLEANUP_NOT_VERIFIED',),
+}
+
+
+def diagnostic_binding(run, source):
+    validate_source(source, source)
+    require(type(run) is str and re.fullmatch('[a-f0-9]{32}', run), 'DIAGNOSTIC_RUN')
+    for key in ('github_run_id', 'github_run_attempt'):
+        require(len(source[key]) <= 20, 'DIAGNOSTIC_RUN')
+    identity = {key: source[key] for key in ('github_run_id', 'github_run_attempt')}
+    identity['execution_id'] = run
+    reference = {'checkout_sha': source['checkout_sha'], 'source_identity_sha256': hashlib.sha256(
+        json.dumps(source, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('ascii')).hexdigest()}
+    return identity, reference
+
+
+def validate_failure(raw, run, source):
+    require(type(raw) is bytes and 0 < len(raw) <= DIAGNOSTIC_LIMIT, 'DIAGNOSTIC_SIZE')
+    value = parse(raw)
+    shape(value, ('schema_version', 'run_identity', 'source_identity_reference',
+                  'last_completed_runtime_stage', 'first_failed_runtime_stage',
+                  'allowlisted_failure_code', 'cleanup_status'))
+    require(value['schema_version'] == 'rg06d-failure-diagnostic-v1', 'DIAGNOSTIC_VERSION')
+    identity, reference = diagnostic_binding(run, source)
+    shape(value['run_identity'], identity)
+    shape(value['source_identity_reference'], reference)
+    require(all(type(v) is str and len(v) <= 64 for v in value['run_identity'].values())
+            and value['run_identity'] == identity, 'DIAGNOSTIC_RUN')
+    require(all(type(v) is str and len(v) <= 64 for v in value['source_identity_reference'].values())
+            and value['source_identity_reference'] == reference, 'DIAGNOSTIC_SOURCE')
+    for key in ('last_completed_runtime_stage', 'first_failed_runtime_stage',
+                'allowlisted_failure_code', 'cleanup_status'):
+        require(type(value[key]) is str and len(value[key]) <= 64, 'DIAGNOSTIC_STRING')
+    stage = value['first_failed_runtime_stage']
+    require(stage in DIAGNOSTIC_STAGES, 'DIAGNOSTIC_STAGE')
+    index = DIAGNOSTIC_STAGES.index(stage)
+    require(value['last_completed_runtime_stage'] == (DIAGNOSTIC_STAGES[index - 1] if index else 'NONE'),
+            'DIAGNOSTIC_TRANSITION')
+    require(value['allowlisted_failure_code'] in (*DIAGNOSTIC_CODES[stage], 'ADMISSION_REJECTED', 'EXECUTION_EXCEPTION'),
+            'DIAGNOSTIC_CODE')
+    require(value['cleanup_status'] in DIAGNOSTIC_CLEANUP, 'DIAGNOSTIC_CLEANUP')
+    return value
+
+
+def diagnostic_path(directory):
+    directory = Path(directory)
+    require('..' not in directory.parts, 'DIAGNOSTIC_PATH')
+    for parent in (directory, *directory.absolute().parents):
+        info = parent.lstat()
+        require(stat.S_ISDIR(info.st_mode) and not parent.is_symlink()
+                and not (getattr(info, 'st_file_attributes', 0) & 0x400), 'DIAGNOSTIC_PATH')
+    return directory / DIAGNOSTIC_NAME
+
+
+def read_failure(directory, run, source):
+    path = diagnostic_path(directory)
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and not path.is_symlink()
+            and not (getattr(info, 'st_file_attributes', 0) & 0x400), 'DIAGNOSTIC_FILE')
+    require(0 < info.st_size <= DIAGNOSTIC_LIMIT, 'DIAGNOSTIC_SIZE')
+    with path.open('rb') as stream:
+        raw = stream.read(DIAGNOSTIC_LIMIT + 1)
+    validate_failure(raw, run, source)
+    return raw
+
+
+def atomic_failure(directory, raw, run, source):
+    value = validate_failure(raw, run, source)
+    path = diagnostic_path(directory)
+    if path.exists() or path.is_symlink():
+        previous = validate_failure(read_failure(directory, run, source), run, source)
+        require({k: v for k, v in value.items() if k != 'cleanup_status'} ==
+                {k: v for k, v in previous.items() if k != 'cleanup_status'}, 'DIAGNOSTIC_FIRST_FAILURE')
+        require(previous['cleanup_status'] == 'PENDING' or previous == value, 'DIAGNOSTIC_CLEANUP_UPDATE')
+    fd, temporary = tempfile.mkstemp(prefix='.failure-diagnostic-', suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        validate_failure(Path(temporary).read_bytes(), run, source)
+        os.replace(temporary, path)
+    finally:
+        if Path(temporary).exists():
+            Path(temporary).unlink()
 
 
 def repository_identity(value):
