@@ -589,16 +589,23 @@ def guarded_connect(original, expected, emit, path, target):
     return connect
 
 
-def validate_service(container, image, service_id, network, host_port):
+def validate_service(container, image, service_id, network, host_port, network_name):
     require(type(service_id) is str and re.fullmatch('[a-f0-9]{64}', service_id), 'SERVICE_ID')
     require(container['Id'] == service_id and container['Image'] == image['Id'], 'SERVICE_IDENTITY')
     require(container['State']['Running'] is True and container['State']['Health']['Status'] == 'healthy', 'SERVICE_HEALTH')
     require(image['Os'] == 'linux' and image['Architecture'] == 'amd64', 'SERVICE_ARCH')
+    require(type(container.get('NetworkSettings')) is dict
+            and type(container['NetworkSettings'].get('Networks')) is dict, 'SERVICE_NETWORK')
+    require(len(container['NetworkSettings']['Networks']) == 1, 'SERVICE_NETWORK')
+    require(classify_network_reference(network) == 'ID'
+            and classify_network_reference(network_name) == 'NAME'
+            and all(type(v) is dict and classify_network_reference(v.get('NetworkID')) == 'ID'
+                    and 'IPAddress' in v for v in container['NetworkSettings']['Networks'].values()), 'SERVICE_NETWORK')
     require(container['NetworkSettings']['Networks'] and
             {v['NetworkID'] for v in container['NetworkSettings']['Networks'].values()} == {network}, 'SERVICE_NETWORK')
     require(set(container['NetworkSettings']['Ports']) == {'5432/tcp'}, 'SERVICE_EXPOSED_PORTS')
     validate_bindings(container['NetworkSettings']['Ports']['5432/tcp'], host_port)
-    require(len(container['NetworkSettings']['Networks']) == 1, 'SERVICE_NETWORK')
+    require(set(container['NetworkSettings']['Networks']) == {network_name}, 'SERVICE_NETWORK')
     address = next(iter(container['NetworkSettings']['Networks'].values()))['IPAddress']
     require(type(address) is str and ipaddress.ip_address(address).version == 4
             and not ipaddress.ip_address(address).is_unspecified
@@ -705,16 +712,144 @@ def validate_connections(value, run, source, expected, path):
         validate_identity(item['identity'], expected, path)
 
 
+
+
+SERVICE_INPUTS = ('pyproject.toml', 'uv.lock', 'db/001_init.sql', 'reqguard/main.py', 'reqguard/persistence.py', 'reqguard/static/index.html', 'reqguard/static/app.mjs', 'reqguard/static/style.css', 'quality/browser/package.json', 'quality/browser/package-lock.json', 'quality/browser/analyses.spec.ts', 'quality/browser/playwright.config.ts', 'quality/browser/playwright.ci.config.ts', 'scripts/run_rg06d_ci.py', '.github/workflows/rg06d-e2e.yml', 'quality/browser/owned-cleanup.ts', 'quality/browser/owned-cleanup.test.ts', 'quality/browser/ci-identity.mjs', 'quality/browser/unit-reporter.mjs', 'scripts/rg06d_admission.py', 'scripts/test_rg06d_admission.py', 'quality/browser/ci-identity.test.mjs', 'quality/browser/ci-preload.integration.test.mjs', 'quality/browser/ci-preload-checks.mjs', 'quality/browser/ci-preload-gate.test.mjs')
+SERVICE_IMAGE = 'postgres:17.11-bookworm@sha256:ec4dfc6571f04fe0731ce948c1500d676af49a7224392dcc6995cc1ee33a94bb'
+
+SERVICE_KEYS = ('schema_version', 'run_id', 'source_identity', 'container_id', 'engine_id',
+                'endpoint', 'image', 'image_id', 'network_reference', 'network_name', 'network_id',
+                'attachment_network_name', 'attachment_network_id', 'host_port', 'fingerprint',
+                'service_observation', 'host_path', 'host_target', 'published_bindings')
+CHILD_EXPECTATIONS = ('RG06B_RUN_ID', 'RG06B_ARTIFACT', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT',
+                      'GITHUB_SHA', 'RG06D_EXPECTED_SOURCE_IDENTITY_SHA256', 'RG06D_SERVICE_ID',
+                      'RG06D_SERVICE_NETWORK', 'RG06B_DB_PORT')
+
+
+def classify_network_reference(value):
+    if type(value) is not str: return 'REJECT'
+    if re.fullmatch(r'[a-f0-9]{64}', value): return 'ID'
+    if re.fullmatch(r'[a-f0-9]+', value): return 'REJECT'
+    if re.fullmatch(r'[a-z][a-z0-9_.-]{0,127}', value): return 'NAME'
+    return 'REJECT'
+
+
+def validate_network(network, reference):
+    kind = classify_network_reference(reference)
+    require(kind != 'REJECT', 'SERVICE_NETWORK')
+    shape(network, ('Id', 'Name'))
+    require(classify_network_reference(network['Id']) == 'ID'
+            and classify_network_reference(network['Name']) == 'NAME', 'SERVICE_NETWORK')
+    require(network['Id' if kind == 'ID' else 'Name'] == reference, 'SERVICE_NETWORK')
+    return network
+
+
+def validate_source_domain(source):
+    # D0 validate_source and diagnostic_binding retain their existing wider behavior.
+    validate_source(source, source)
+    require(set(source['inputs']) == set(SERVICE_INPUTS), 'SOURCE_PRODUCER_DOMAIN')
+    return source
+
+
+def canonical_source_bytes(source):
+    validate_source_domain(source)
+    return json.dumps(source, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('ascii')
+
+
+def validate_service_receipt(service, run, source, env):
+    shape(service, SERVICE_KEYS)
+    require(service['schema_version'] == 'rg06d-service-v3' and service['run_id'] == run
+            and type(run) is str and re.fullmatch('[a-f0-9]{32}', run), 'SERVICE_RECEIPT')
+    validate_source_domain(service['source_identity'])
+    validate_source(service['source_identity'], source)
+    require(source['github_run_id'] == env['GITHUB_RUN_ID']
+            and source['github_run_attempt'] == env['GITHUB_RUN_ATTEMPT'], 'SERVICE_CONTEXT')
+    for key in ('container_id', 'engine_id', 'endpoint', 'image', 'image_id', 'network_reference',
+                'network_name', 'network_id', 'attachment_network_name', 'attachment_network_id', 'host_port'):
+        require(type(service[key]) is str and 0 < len(service[key]) <= 512, 'SERVICE_RECEIPT_TYPE')
+        service[key].encode('utf-8')  # Escaped unpaired surrogates are not Unicode scalar values.
+    require(classify_network_reference(service['container_id']) == 'ID'
+            and service['container_id'] == env['RG06D_SERVICE_ID']
+            and service['host_port'] == env['RG06B_DB_PORT']
+            and service['endpoint'] == 'unix:///var/run/docker.sock' and service['image'] == SERVICE_IMAGE
+            and re.fullmatch('sha256:[a-f0-9]{64}', service['image_id']), 'SERVICE_CONTEXT')
+    expected_reference = env['RG06D_SERVICE_NETWORK']
+    require(classify_network_reference(expected_reference) != 'REJECT'
+            and classify_network_reference(service['network_reference']) == classify_network_reference(expected_reference)
+            and service['network_reference'] == expected_reference, 'SERVICE_NETWORK')
+    validate_network({'Id': service['network_id'], 'Name': service['network_name']}, expected_reference)
+    require(classify_network_reference(service['attachment_network_id']) == 'ID'
+            and classify_network_reference(service['attachment_network_name']) == 'NAME'
+            and service['attachment_network_id'] == service['network_id']
+            and service['attachment_network_name'] == service['network_name'], 'SERVICE_NETWORK')
+    validate_bindings(service['published_bindings'], service['host_port'])
+    validate_client_target('127.0.0.1', int(service['host_port']), service['host_target'])
+    validate_identity(service['service_observation'], service['fingerprint'], {'address': '127.0.0.1', 'port': 5432})
+    shape(service['host_path'], ('address', 'port'))
+    host = service['host_path']
+    require(type(host['address']) is str and ipaddress.ip_address(host['address']).version == 4
+            and not ipaddress.ip_address(host['address']).is_loopback
+            and not ipaddress.ip_address(host['address']).is_unspecified
+            and type(host['port']) is int and host['port'] == 5432, 'SERVICE_HOST_PATH')
+    return service
+
+
+def child_artifact(env, root):
+    require(all(type(env.get(k)) is str and bool(env[k]) for k in CHILD_EXPECTATIONS), 'CHILD_EXPECTATIONS')
+    require(re.fullmatch('[a-f0-9]{32}', env['RG06B_RUN_ID'])
+            and re.fullmatch('[a-f0-9]{40}', env['GITHUB_SHA'])
+            and re.fullmatch('[a-f0-9]{64}', env['RG06D_EXPECTED_SOURCE_IDENTITY_SHA256'])
+            and re.fullmatch('[a-f0-9]{64}', env['RG06D_SERVICE_ID']), 'CHILD_EXPECTATIONS')
+    require(all(re.fullmatch('[1-9][0-9]*', env[k]) for k in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'))
+            and classify_network_reference(env['RG06D_SERVICE_NETWORK']) != 'REJECT'
+            and re.fullmatch('[0-9]+', env['RG06B_DB_PORT'])
+            and 1024 <= int(env['RG06B_DB_PORT']) <= 65535, 'CHILD_EXPECTATIONS')
+    expected = root / 'quality/browser/.artifacts' / env['RG06B_RUN_ID']
+    require(env['RG06B_ARTIFACT'] == str(expected), 'CHILD_ARTIFACT')
+    diagnostic_path(expected)  # Existing ancestor/symlink/reparse and traversal policy.
+    return expected
+
+
+def validate_child_service(service, env):
+    source = validate_source_domain(service['source_identity'])
+    require(source['checkout_sha'] == env['GITHUB_SHA']
+            and source['github_run_id'] == env['GITHUB_RUN_ID']
+            and source['github_run_attempt'] == env['GITHUB_RUN_ATTEMPT']
+            and hashlib.sha256(canonical_source_bytes(source)).hexdigest() ==
+                env['RG06D_EXPECTED_SOURCE_IDENTITY_SHA256'], 'CHILD_SOURCE')
+    # The received source has now been compared to independent parent digest/CI values.
+    return validate_service_receipt(service, env['RG06B_RUN_ID'], source, env)
+
+
+def read_child_service(directory):
+    path = directory / 'service-identity.json'
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode) and not path.is_symlink()
+            and not getattr(before, 'st_file_attributes', 0) & 0x400
+            and 0 < before.st_size <= 65536, 'CHILD_FILE')
+    with path.open('rb') as stream:
+        opened = os.fstat(stream.fileno())
+        require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), 'CHILD_FILE')
+        raw = stream.read(65537)
+        after = os.fstat(stream.fileno())
+    require(0 < len(raw) <= 65536 and before.st_size == after.st_size == len(raw)
+            and before.st_mtime_ns == after.st_mtime_ns
+            and (path.lstat().st_dev, path.lstat().st_ino) == (before.st_dev, before.st_ino), 'CHILD_FILE')
+    return parse(raw)
+
+
 def api_main():
     # Used only as the child-process entrypoint of the Linux test harness.
     import sys
     import uuid
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root))
-    path = Path(os.environ['RG06B_ARTIFACT'])
-    require(path == root / 'quality/browser/.artifacts' / os.environ['RG06B_RUN_ID'], 'API_ARTIFACT_BOUNDARY')
-    service = parse(read(path, 'service-identity.json'))
-    require(service['schema_version'] == 'rg06d-service-v2' and service['run_id'] == path.name, 'API_SERVICE_RECEIPT')
+    try:
+        path = child_artifact(os.environ, root)
+        service = validate_child_service(read_child_service(path), os.environ)
+    except Exception:
+        print('RG06D_API_RECEIPT_REJECTED', file=sys.stderr)
+        return 1
     expected = service['fingerprint']
     import psycopg
     import uvicorn
@@ -726,7 +861,7 @@ def api_main():
 
 
 if __name__ == '__main__':
-    api_main()
+    raise SystemExit(api_main())
 
 
 # Reviewed semantic sites. SHA-256 values bind normalized AST operations, not lines.
@@ -742,22 +877,22 @@ FIRST_ERROR_REGISTRY = (
     ('R.SVC.ENGINE', 'ENGINE_ID', (('C', 'service_admission', 'b803fe9fa543f21b5237494f49275022fa5f86a2d1060b0ab033e10537a55294'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
     ('R.SVC.ID', 'SERVICE_ID', (('C', 'service_admission', '18f38a09d2adf6ef01aaf34e75ebb8851fb883ed9c6ebac0496c5ddcfa925a88'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
     ('R.SVC.DIGEST', 'SERVICE_IMAGE_DIGEST', (('C', 'service_admission', '439c6a2d3124de3b0b24c38b7b8aa3651b965c950e81db55c09776fa2554b8a1'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.SVC.ID', 'SERVICE_ID', (('A', 'validate_service', '8addd2f9b052c429813d2ad653ecd031cee4d72feb94fe8b33f271e18779913c'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.SVC.IDENTITY', 'SERVICE_IDENTITY', (('A', 'validate_service', '39bcadd3558e679bbdece7938f7076c043cc83a2a448de30c36cd929e2668f5e'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.SVC.HEALTH', 'SERVICE_HEALTH', (('A', 'validate_service', '41e7ea800299fe9ad9418c422dbb74cff3faf415b9a2bde55bfae161a6183160'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.SVC.ARCH', 'SERVICE_ARCH', (('A', 'validate_service', '83571c748a09f54c91eee23a33333bfbc85979e0db6cee217c282fbdad7b808d'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.SVC.NETWORK_ID_SET', 'SERVICE_NETWORK', (('A', 'validate_service', '5f36dd577109d645f0dcae9ca65cc8eb33115bbba81a2c18df4c09ff458db19f'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.SVC.PORT_KEYS', 'SERVICE_EXPOSED_PORTS', (('A', 'validate_service', 'ae33c48e39feee2fd055ad61287c3b4f5b1b8085cf849f122783de25c6d99c20'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.SVC.NETWORK_COUNT', 'SERVICE_NETWORK', (('A', 'validate_service', '96397de25e349a3c93ddd3d8c50c44310b556d716aeab9a9f6abe879ede1785b'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.SVC.ADDRESS', 'SERVICE_ADDRESS', (('A', 'validate_service', '9560e5d36879081cb14912591e7c4d8621e8c4ca40e138738896fddd4a66356e'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.SVC.NO_BIND', 'SERVICE_BIND', (('A', 'validate_service', 'bb17c1e23f993781e04b175c7a666ecf5cc796c38eb3443a90190924578be4c5'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.SVC.PGDATA', 'SERVICE_STORAGE', (('A', 'validate_service', '09baa2e4bb39156ac35498ebfafc62c9980a1c902bfa203b6e54d913a8e7cc72'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.BIND.PORT_INPUT', 'SERVICE_PORT', (('A', 'validate_bindings', '14738e5ea9b60ca0e96eb2959497af50cc4dfd8512bc1cdf9a7dfb9364a8ed74'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.BIND.COUNT', 'SERVICE_BINDINGS', (('A', 'validate_bindings', '361722cb7a483d7de27999fb4982fe0d15f1fe424a351660206703bd82524a42'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.BIND.ITEM_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_bindings', '15a6ca75a362284c5d0216a024516fc6318dc38cc479ea7c4982bfdf4b16e6a7'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.BIND.PORT_MATCH', 'SERVICE_PORT', (('A', 'validate_bindings', '35060dbf7c3a1710573dbc6963eff8938a376d12aeb6f72d2879cb94611c4182'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.BIND.IP_TYPE', 'SERVICE_HOSTIP', (('A', 'validate_bindings', 'c6d6c9dc715ece54e5eed561f8021cd4321ecc5d85a959ea604c8d0044738653'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
-    ('A.BIND.IP_SET', 'SERVICE_HOSTIP', (('A', 'validate_bindings', '9c0fb25d8e41d22cf7d26a5f72e89c0ac051d09407f258c9d0c5d8f28fbb69a6'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.ID', 'SERVICE_ID', (('A', 'validate_service', '8addd2f9b052c429813d2ad653ecd031cee4d72feb94fe8b33f271e18779913c'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.IDENTITY', 'SERVICE_IDENTITY', (('A', 'validate_service', '39bcadd3558e679bbdece7938f7076c043cc83a2a448de30c36cd929e2668f5e'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.HEALTH', 'SERVICE_HEALTH', (('A', 'validate_service', '41e7ea800299fe9ad9418c422dbb74cff3faf415b9a2bde55bfae161a6183160'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.ARCH', 'SERVICE_ARCH', (('A', 'validate_service', '83571c748a09f54c91eee23a33333bfbc85979e0db6cee217c282fbdad7b808d'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.NETWORK_ID_SET', 'SERVICE_NETWORK', (('A', 'validate_service', '5f36dd577109d645f0dcae9ca65cc8eb33115bbba81a2c18df4c09ff458db19f'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.PORT_KEYS', 'SERVICE_EXPOSED_PORTS', (('A', 'validate_service', 'ae33c48e39feee2fd055ad61287c3b4f5b1b8085cf849f122783de25c6d99c20'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.NETWORK_COUNT', 'SERVICE_NETWORK', (('A', 'validate_service', '96397de25e349a3c93ddd3d8c50c44310b556d716aeab9a9f6abe879ede1785b'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.ADDRESS', 'SERVICE_ADDRESS', (('A', 'validate_service', '9560e5d36879081cb14912591e7c4d8621e8c4ca40e138738896fddd4a66356e'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.NO_BIND', 'SERVICE_BIND', (('A', 'validate_service', 'bb17c1e23f993781e04b175c7a666ecf5cc796c38eb3443a90190924578be4c5'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.PGDATA', 'SERVICE_STORAGE', (('A', 'validate_service', '09baa2e4bb39156ac35498ebfafc62c9980a1c902bfa203b6e54d913a8e7cc72'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.PORT_INPUT', 'SERVICE_PORT', (('A', 'validate_bindings', '14738e5ea9b60ca0e96eb2959497af50cc4dfd8512bc1cdf9a7dfb9364a8ed74'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.COUNT', 'SERVICE_BINDINGS', (('A', 'validate_bindings', '361722cb7a483d7de27999fb4982fe0d15f1fe424a351660206703bd82524a42'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.ITEM_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_bindings', '15a6ca75a362284c5d0216a024516fc6318dc38cc479ea7c4982bfdf4b16e6a7'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.PORT_MATCH', 'SERVICE_PORT', (('A', 'validate_bindings', '35060dbf7c3a1710573dbc6963eff8938a376d12aeb6f72d2879cb94611c4182'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.IP_TYPE', 'SERVICE_HOSTIP', (('A', 'validate_bindings', 'c6d6c9dc715ece54e5eed561f8021cd4321ecc5d85a959ea604c8d0044738653'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.IP_SET', 'SERVICE_HOSTIP', (('A', 'validate_bindings', '9c0fb25d8e41d22cf7d26a5f72e89c0ac051d09407f258c9d0c5d8f28fbb69a6'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', 'd2a0e2a2a2aa8b1e58a7068659df0b9fa077f872cea9d1c15a9b2586fbdce263'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
     ('A.SVCID.OBS_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_identity', '344ac419fad4fa33a11edf7235937b5a5238f35d4e79ff1e4f542befff5dc2e3'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
     ('A.SVCID.FP_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_identity', 'c76301082df8ac9853579fcf5ce1db69e53e08452da12d6198c7dd0cc8a766b6'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
     ('A.SVCID.PATH_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_identity', '88087867c4ed9bcd9f0c69e3122c5845bfa52f2d6e0cf3a0cfede94e7261a1a5'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
@@ -811,8 +946,8 @@ FIRST_ERROR_FUNCTION_HASHES = {
     ('A', 'validate_client_target'): 'd5b5bb06e0e53e2cd9f4bf67d2253c8b396cd86b67c1f192c0856f2233b0d1eb',
     ('A', 'validate_bindings'): 'dd2de9537ecd9610270e5ba496c9535a33b7aaad86e1a06d38e6b2fee473c8c0',
     ('A', 'observe'): 'f862eb2ef3388f6fda78b8e5322257b1605a64cf491480b0e8ca931717c8c18d',
-    ('A', 'validate_service'): '3d326cfa99ad5a8d10fe8e376dbe744ab9b79219c3c7f482de81fb271f68cabe',
+    ('A', 'validate_service'): '23f17491251d67675ac1b93cad00bb187dae59dba7b36b5d66c62eac92c73f63',
     ('C', 'require'): 'ba2fe4aedf7ede9bf717f2378bb6e7735b27a15ffd6793b6e1772a21374ecc22',
-    ('C', 'service_admission'): '4cfea7ed900f24a7c52bc068d40551e89a80f8252563bb4c13fd356edaf106e8',
-    ('C', 'run_tests'): '21f21da3b844f2b78bcf16e9bf157de83e9d75d3f0f84448cb0f3e97a9adbd5d',
+    ('C', 'service_admission'): 'a15aa87a1e120e452e01508535dbac176b7aa1c109d0ead4b669427a91dba12b',
+    ('C', 'run_tests'): '900acffbda5f09811708e3b3d499eb6008534749177ceee31b3801f7b8b8d642',
 }

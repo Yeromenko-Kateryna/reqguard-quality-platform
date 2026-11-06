@@ -4,6 +4,7 @@ import ast
 from contextlib import ExitStack, contextmanager
 import sys
 import zipfile
+import urllib.parse
 import hashlib
 import json
 import io
@@ -23,7 +24,7 @@ import run_rg06d_ci as ci
 RUN = 'a' * 32
 SOURCE = {'checkout_sha': 'b' * 40, 'pr_head_sha': None, 'pr_base_sha': None,
           'tested_merge_sha': None, 'github_run_id': '123', 'github_run_attempt': '1',
-          'inputs': {'uv.lock': 'c' * 64, 'quality/browser/package-lock.json': 'd' * 64},
+          'inputs': {**{n: 'c' * 64 for n in ci.INPUTS}, 'quality/browser/package-lock.json': 'd' * 64},
           'python_lock_sha256': 'c' * 64, 'node_lock_sha256': 'd' * 64}
 FP = {'db': 'reqguard_rg06b', 'role': 'reqguard_rg06b', 'version': '170011',
       'system_id': '1234567'}
@@ -84,10 +85,12 @@ def bundle(directory):
     a.write(directory, 'ownership-unit.json', unit())
     a.write(directory, 'pg-preload.json', preload())
     a.write(directory, 'connections.json', connections())
-    a.write(directory, 'service-identity.json', {'schema_version': 'rg06d-service-v2', 'run_id': RUN,
+    a.write(directory, 'service-identity.json', {'schema_version': 'rg06d-service-v3', 'run_id': RUN,
             'source_identity': SOURCE, 'container_id': ENV['RG06D_SERVICE_ID'], 'engine_id': 'synthetic-engine',
             'endpoint': 'unix:///var/run/docker.sock', 'image': ci.IMAGE, 'image_id': 'sha256:' + 'e' * 64,
-            'network_id': ENV['RG06D_SERVICE_NETWORK'], 'host_port': '49123', 'fingerprint': FP,
+            'network_id': ENV['RG06D_SERVICE_NETWORK'], 'network_reference': ENV['RG06D_SERVICE_NETWORK'],
+            'network_name': 'job', 'attachment_network_name': 'job', 'attachment_network_id': ENV['RG06D_SERVICE_NETWORK'],
+            'host_port': '49123', 'fingerprint': FP,
             'service_observation': {**FP, 'address': '127.0.0.1', 'port': 5432, 'backend_pid': 99},
             'host_path': SERVER_PATH, 'host_target': TARGET,
             'published_bindings': [{'HostIp': '0.0.0.0', 'HostPort': '49123'}]})
@@ -349,7 +352,7 @@ class IdentityTests(unittest.TestCase):
                      'NetworkSettings': {'Networks': {'job': {'NetworkID': 'f' * 64, 'IPAddress': '172.18.0.2'}},
                                          'Ports': {'5432/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '49123'}]}}}
         image = {'Id': 'image', 'Os': 'linux', 'Architecture': 'amd64'}
-        a.validate_service(container, image, 'e' * 64, 'f' * 64, '49123')
+        a.validate_service(container, image, 'e' * 64, 'f' * 64, '49123', 'job')
         for mutate in (lambda c: c.update(Id='9' * 64), lambda c: c.update(Image='wrong'),
                        lambda c: c['NetworkSettings']['Ports']['5432/tcp'][0].update(HostPort='9999'),
                        lambda c: c['NetworkSettings']['Networks']['job'].update(NetworkID='9' * 64),
@@ -357,7 +360,7 @@ class IdentityTests(unittest.TestCase):
                        lambda c: c['NetworkSettings']['Ports'].update({'9999/tcp': []})):
             value = copy.deepcopy(container); mutate(value)
             with self.assertRaises(a.AdmissionError):
-                a.validate_service(value, image, 'e' * 64, 'f' * 64, '49123')
+                a.validate_service(value, image, 'e' * 64, 'f' * 64, '49123', 'job')
 
 
 class ReporterBoundaryTests(unittest.TestCase):
@@ -1078,7 +1081,7 @@ class FirstErrorV2Tests(unittest.TestCase):
 
     def pg_run(self, change=None, container_raw=None, image_raw=None, psql_raw=None,
                command_error=None, host_observed=None, driver_error=None, query_error=None,
-               environment_updates=None):
+               environment_updates=None, network_raw=None, complete_pg=False):
         # Real run_tests/service_admission/predicates/capture; prior gates and all
         # external operations are deterministic doubles, never acceptance evidence.
         container = {'Id': 'e' * 64, 'Image': 'image',
@@ -1086,8 +1089,9 @@ class FirstErrorV2Tests(unittest.TestCase):
                      'Mounts': [{'Type': 'volume', 'Destination': '/var/lib/postgresql/data'}],
                      'NetworkSettings': {'Networks': {'job': {'NetworkID': 'f' * 64, 'IPAddress': '172.18.0.2'}},
                                          'Ports': {'5432/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '49123'}]}}}
+        container['Image'] = 'sha256:' + 'e' * 64
         if change: change(container)
-        image = {'Id': 'image', 'Os': 'linux', 'Architecture': 'amd64', 'RepoDigests': [ci.IMAGE]}
+        image = {'Id': 'sha256:' + 'e' * 64, 'Os': 'linux', 'Architecture': 'amd64', 'RepoDigests': [ci.IMAGE]}
         observed = {**FP, 'address': '127.0.0.1', 'port': 5432, 'backend_pid': 99}
         root = self.directory / 'runtime'; root.mkdir()
         package = root / 'quality/browser'; package.mkdir(parents=True)
@@ -1100,6 +1104,8 @@ class FirstErrorV2Tests(unittest.TestCase):
             '{"browsers":[{"name":"chromium","revision":"1248"}]}')
         browser = root / 'cache/chromium-1248/chrome'; browser.parent.mkdir(parents=True); browser.write_bytes(b'fixture')
         a.write(self.raw, 'launch.json', {'inputs': {}})
+        if complete_pg:
+            (root / 'db').mkdir(); (root / 'db/001_init.sql').write_text('synthetic schema')
         def output(argv):
             if argv[0] in ('node', 'npm', 'uv'):
                 if '--input-type=module' in argv: return str(browser)
@@ -1108,6 +1114,7 @@ class FirstErrorV2Tests(unittest.TestCase):
             if argv[1:3] == ['context', 'show']: return 'default'
             if argv[1:3] == ['context', 'inspect']: return 'unix:///var/run/docker.sock'
             if 'info' in argv: return 'fixture-engine'
+            if 'network' in argv: return json.dumps({'Id': 'f' * 64, 'Name': 'job'}) if network_raw is None else network_raw
             if 'exec' in argv: return json.dumps(observed) if psql_raw is None else psql_raw
             if 'image' in argv: return json.dumps(image) if image_raw is None else image_raw
             return json.dumps(container) if container_raw is None else container_raw
@@ -1116,10 +1123,18 @@ class FirstErrorV2Tests(unittest.TestCase):
             if driver_error is not None: raise driver_error
             if host_observed is None: raise RuntimeError('fixture stops before SQL')
             connection = FakeConnection(observed=host_observed)
+            if complete_pg:
+                def execute(sql):
+                    connection.calls.append(sql)
+                    row = ('reqguard_rg06b', 'reqguard_rg06b', '170011') if 'current_database' in sql else (None,) if 'to_regclass' in sql else (0,)
+                    return SimpleNamespace(fetchone=lambda: row)
+                connection.execute = execute
+                connection.commit = lambda: None
             connection.query_error = query_error
             yield connection
         environment = {**ENV, 'RG06D_RUNNER_ENV': 'github-hosted', 'GITHUB_ACTIONS': 'true',
-                       'RG06D_DB_PASSWORD': ci.PASSWORD, 'PLAYWRIGHT_BROWSERS_PATH': str(root / 'cache')}
+                       'RG06D_DB_PASSWORD': ci.PASSWORD, 'PLAYWRIGHT_BROWSERS_PATH': str(root / 'cache'),
+                       'GITHUB_SHA': self.source['checkout_sha']}
         with ExitStack() as stack:
             for key in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH'):
                 environment[key] = ''
@@ -1135,6 +1150,13 @@ class FirstErrorV2Tests(unittest.TestCase):
                  (ci, 'no_descendants', lambda s: s.update(descendantsExited=True))):
                 stack.enter_context(patch.object(obj, name, value))
             stack.enter_context(patch.dict(sys.modules, {'psycopg': SimpleNamespace(connect=connect)}))
+            if complete_pg:
+                sock = MagicMock(); sock.__enter__.return_value = sock; sock.getsockname.return_value = ('127.0.0.1', 49124)
+                stack.enter_context(patch.object(ci.socket, 'socket', return_value=sock))
+                def stop_spawn(*args, **kwargs):
+                    self.last_child_env = dict(kwargs['env'])
+                    raise RuntimeError('controlled boundary before real child spawn')
+                stack.enter_context(patch.object(ci.subprocess, 'Popen', side_effect=stop_spawn))
             self.assertEqual(ci.run_tests(), 1)
         value = self.value()
         evidence = os.environ.get('RG06D_LOCAL_EVIDENCE')
@@ -1406,8 +1428,8 @@ class FirstErrorV2Tests(unittest.TestCase):
         with self.assertRaises(a.AdmissionError): a.validate_failure(encoded({**old, 'first_admission_error_code': 'UNRESOLVED'}), RUN, self.source)
         with self.assertRaises(a.AdmissionError): a.atomic_failure(self.raw, encoded(old), RUN, self.source)
 
-    def test_T18_network_defect_not_fixed(self):
-        value = self.pg_run(change=lambda c: c['NetworkSettings']['Networks']['job'].update(NetworkID='network-name'))
+    def test_T18_network_mismatch_still_rejected(self):
+        value = self.pg_run(change=lambda c: c['NetworkSettings']['Networks']['job'].update(NetworkID='9' * 64))
         self.assertEqual(value['first_admission_error_code'], 'SERVICE_NETWORK')
         workflow = (ci.ROOT / '.github/workflows/rg06d-e2e.yml').read_text()
         self.assertIn('RG06D_SERVICE_NETWORK: ${{ job.services.postgres.network }}', workflow)
@@ -1507,6 +1529,936 @@ class FirstErrorV2Tests(unittest.TestCase):
     def test_pinned_3_12_10_attribution(self):
         self.test_T03_distinct_network_predicates_actual_run()
         self.tearDown_fixture(); self.test_T04_nested_shapes_parser_and_invocation_roles()
+
+
+
+
+CANONICAL_VECTORS = json.loads(r'''{
+  "schema_version": "rg06d-canonical-source-vectors-v1",
+  "source_commit": "bbe7c42909b43a8dd4d68b1e90a936129bd6743f",
+  "algorithm": "sha256(json.dumps(source,sort_keys=True,separators=(\",\",\":\"),allow_nan=False).encode(\"ascii\")); ensure_ascii defaults True",
+  "source_keys": [
+    "checkout_sha",
+    "pr_head_sha",
+    "pr_base_sha",
+    "tested_merge_sha",
+    "github_run_id",
+    "github_run_attempt",
+    "inputs",
+    "python_lock_sha256",
+    "node_lock_sha256"
+  ],
+  "fixed_producer_inputs": [
+    "pyproject.toml",
+    "uv.lock",
+    "db/001_init.sql",
+    "reqguard/main.py",
+    "reqguard/persistence.py",
+    "reqguard/static/index.html",
+    "reqguard/static/app.mjs",
+    "reqguard/static/style.css",
+    "quality/browser/package.json",
+    "quality/browser/package-lock.json",
+    "quality/browser/analyses.spec.ts",
+    "quality/browser/playwright.config.ts",
+    "quality/browser/playwright.ci.config.ts",
+    "scripts/run_rg06d_ci.py",
+    ".github/workflows/rg06d-e2e.yml",
+    "quality/browser/owned-cleanup.ts",
+    "quality/browser/owned-cleanup.test.ts",
+    "quality/browser/ci-identity.mjs",
+    "quality/browser/unit-reporter.mjs",
+    "scripts/rg06d_admission.py",
+    "scripts/test_rg06d_admission.py",
+    "quality/browser/ci-identity.test.mjs",
+    "quality/browser/ci-preload.integration.test.mjs",
+    "quality/browser/ci-preload-checks.mjs",
+    "quality/browser/ci-preload-gate.test.mjs"
+  ],
+  "valid_vectors": [
+    {
+      "id": "V01_MINIMAL_VALIDATOR_ONLY",
+      "valid": true,
+      "validity_note": "Valid under Python validate_source self-check; not emitted by fixed INPUTS producer",
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "canonical_json": "{\"checkout_sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"github_run_attempt\":\"1\",\"github_run_id\":\"123\",\"inputs\":{\"quality/browser/package-lock.json\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"uv.lock\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"node_lock_sha256\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"pr_base_sha\":null,\"pr_head_sha\":null,\"python_lock_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tested_merge_sha\":null}",
+      "canonical_hex": "7b22636865636b6f75745f736861223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262222c226769746875625f72756e5f617474656d7074223a2231222c226769746875625f72756e5f6964223a22313233222c22696e70757473223a7b227175616c6974792f62726f777365722f7061636b6167652d6c6f636b2e6a736f6e223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c2275762e6c6f636b223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161227d2c226e6f64655f6c6f636b5f736861323536223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c2270725f626173655f736861223a6e756c6c2c2270725f686561645f736861223a6e756c6c2c22707974686f6e5f6c6f636b5f736861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227465737465645f6d657267655f736861223a6e756c6c7d",
+      "sha256": "ace8dd65836b133f0e686bce87667a3d907a6a771d32119f126889606ffa1680",
+      "byte_length": 533
+    },
+    {
+      "id": "V02_COMPLETE_PRODUCER_DOMAIN",
+      "valid": true,
+      "validity_note": "All 25 immutable INPUTS names; synthetic digests for standalone vector",
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "quality/browser/ci-preload-gate.test.mjs": "234c0e9936f76874d40691aacbe543b46b31cb58722ec7759fdcfa668468ee8e",
+          "quality/browser/ci-preload-checks.mjs": "dd2ef4cc2fd417841f15cb4034ab3e58dd59c2c22de2c2ddf8943c2793b9df88",
+          "quality/browser/ci-preload.integration.test.mjs": "ae024167998e90426c419ba8ce1e4f181403fe83d41409f46568d74dcecb2e01",
+          "quality/browser/ci-identity.test.mjs": "ebecd80b0d19beb34652176dcf4e49695936989aed17273a08d0eb80c6d9e866",
+          "scripts/test_rg06d_admission.py": "f9e80ab47c5820b7846ef55901129500200d786bd754a96442531336b6cdfae9",
+          "scripts/rg06d_admission.py": "5411f46fa48f7b7150d4787f4b0091cc546e3c1f35f094a9532e970a6fbffd3c",
+          "quality/browser/unit-reporter.mjs": "ff2eac5f6f6e1dc16582cadd1d0a9f861b2d9d8823f6ef4fa4a959b6319e6819",
+          "quality/browser/ci-identity.mjs": "00d8e9983092acd0b39e38d997f2fad9b42ca242a0415a54ca1b67f8aa3a9706",
+          "quality/browser/owned-cleanup.test.ts": "8223224cd1072761979942766b588709e624299dabab75879fce0599eeb845bb",
+          "quality/browser/owned-cleanup.ts": "2f087f903530ea939691ca21cf04dad285e6692cea1cfd203916ce4d2130d0c2",
+          ".github/workflows/rg06d-e2e.yml": "672638670570967088ecd3e6f73182cefeb7c8a52d5a0a58b6dffa5e243b0eb9",
+          "scripts/run_rg06d_ci.py": "12aecb367f96b64f75b9b69bf43a7c8091ffe98d808c20a556db219444efb008",
+          "quality/browser/playwright.ci.config.ts": "09b0d1168708ed511f371c9fc2d293c290e91f04db7b2b88883cbe194733a8f4",
+          "quality/browser/playwright.config.ts": "bbbae0f33ef2ff05378515d10f6b8aea3bd117289c7b9a5aa922e95e8af8269e",
+          "quality/browser/analyses.spec.ts": "a6af1d5f44e122fd7f0f2e25a329f2a4fdb210aa2852651adafd2ae56ab85365",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "quality/browser/package.json": "bc85aab2fe62c86cd773e33e1dddf7ed6fe567c759f02be1f57099e6ba38d41d",
+          "reqguard/static/style.css": "80b7a58863172b70fdb23a09672c9ee6a761afb1d1540ce9746dc04645aa8026",
+          "reqguard/static/app.mjs": "ee2d92d750b58e20f8862d535e4b1f979ba57cece84b46de63463942d488709b",
+          "reqguard/static/index.html": "8eb10a3ce951cd98d0fe7f2aef0b89f38e358eb2400c1fff90cbe3ed61fd6c24",
+          "reqguard/persistence.py": "767d0c934fba3317f484792f62341b5993d310208684bbde22de847223d03891",
+          "reqguard/main.py": "ecc439c7cc682d39b4d32913f3eaa33e3b87996f12d0cb95ed2ef52e6c0aeefa",
+          "db/001_init.sql": "d0c07dfc5aa7a23362e2f3fbdefaabd07618deb280eb9b9411f5b37af69a9e0f",
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "pyproject.toml": "50c86b7ed8ac2cf95bd48334961bf0530cdc77b5a56f852c5c61b89d735fd711"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "canonical_json": "{\"checkout_sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"github_run_attempt\":\"1\",\"github_run_id\":\"123\",\"inputs\":{\".github/workflows/rg06d-e2e.yml\":\"672638670570967088ecd3e6f73182cefeb7c8a52d5a0a58b6dffa5e243b0eb9\",\"db/001_init.sql\":\"d0c07dfc5aa7a23362e2f3fbdefaabd07618deb280eb9b9411f5b37af69a9e0f\",\"pyproject.toml\":\"50c86b7ed8ac2cf95bd48334961bf0530cdc77b5a56f852c5c61b89d735fd711\",\"quality/browser/analyses.spec.ts\":\"a6af1d5f44e122fd7f0f2e25a329f2a4fdb210aa2852651adafd2ae56ab85365\",\"quality/browser/ci-identity.mjs\":\"00d8e9983092acd0b39e38d997f2fad9b42ca242a0415a54ca1b67f8aa3a9706\",\"quality/browser/ci-identity.test.mjs\":\"ebecd80b0d19beb34652176dcf4e49695936989aed17273a08d0eb80c6d9e866\",\"quality/browser/ci-preload-checks.mjs\":\"dd2ef4cc2fd417841f15cb4034ab3e58dd59c2c22de2c2ddf8943c2793b9df88\",\"quality/browser/ci-preload-gate.test.mjs\":\"234c0e9936f76874d40691aacbe543b46b31cb58722ec7759fdcfa668468ee8e\",\"quality/browser/ci-preload.integration.test.mjs\":\"ae024167998e90426c419ba8ce1e4f181403fe83d41409f46568d74dcecb2e01\",\"quality/browser/owned-cleanup.test.ts\":\"8223224cd1072761979942766b588709e624299dabab75879fce0599eeb845bb\",\"quality/browser/owned-cleanup.ts\":\"2f087f903530ea939691ca21cf04dad285e6692cea1cfd203916ce4d2130d0c2\",\"quality/browser/package-lock.json\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"quality/browser/package.json\":\"bc85aab2fe62c86cd773e33e1dddf7ed6fe567c759f02be1f57099e6ba38d41d\",\"quality/browser/playwright.ci.config.ts\":\"09b0d1168708ed511f371c9fc2d293c290e91f04db7b2b88883cbe194733a8f4\",\"quality/browser/playwright.config.ts\":\"bbbae0f33ef2ff05378515d10f6b8aea3bd117289c7b9a5aa922e95e8af8269e\",\"quality/browser/unit-reporter.mjs\":\"ff2eac5f6f6e1dc16582cadd1d0a9f861b2d9d8823f6ef4fa4a959b6319e6819\",\"reqguard/main.py\":\"ecc439c7cc682d39b4d32913f3eaa33e3b87996f12d0cb95ed2ef52e6c0aeefa\",\"reqguard/persistence.py\":\"767d0c934fba3317f484792f62341b5993d310208684bbde22de847223d03891\",\"reqguard/static/app.mjs\":\"ee2d92d750b58e20f8862d535e4b1f979ba57cece84b46de63463942d488709b\",\"reqguard/static/index.html\":\"8eb10a3ce951cd98d0fe7f2aef0b89f38e358eb2400c1fff90cbe3ed61fd6c24\",\"reqguard/static/style.css\":\"80b7a58863172b70fdb23a09672c9ee6a761afb1d1540ce9746dc04645aa8026\",\"scripts/rg06d_admission.py\":\"5411f46fa48f7b7150d4787f4b0091cc546e3c1f35f094a9532e970a6fbffd3c\",\"scripts/run_rg06d_ci.py\":\"12aecb367f96b64f75b9b69bf43a7c8091ffe98d808c20a556db219444efb008\",\"scripts/test_rg06d_admission.py\":\"f9e80ab47c5820b7846ef55901129500200d786bd754a96442531336b6cdfae9\",\"uv.lock\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"node_lock_sha256\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"pr_base_sha\":null,\"pr_head_sha\":null,\"python_lock_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tested_merge_sha\":null}",
+      "canonical_hex": "7b22636865636b6f75745f736861223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262222c226769746875625f72756e5f617474656d7074223a2231222c226769746875625f72756e5f6964223a22313233222c22696e70757473223a7b222e6769746875622f776f726b666c6f77732f72673036642d6532652e796d6c223a2236373236333836373035373039363730383865636433653666373331383263656665623763386135326435613061353862366466666135653234336230656239222c2264622f3030315f696e69742e73716c223a2264306330376466633561613761323333363265326633666264656661616264303736313864656232383065623962393431316635623337616636396139653066222c22707970726f6a6563742e746f6d6c223a2235306338366237656438616332636639356264343833333439363162663035333063646337376235613536663835326335633631623839643733356664373131222c227175616c6974792f62726f777365722f616e616c797365732e737065632e7473223a2261366166316435663434653132326664376630663265323561333239663261346664623231306161323835323635316164616664326165353661623835333635222c227175616c6974792f62726f777365722f63692d6964656e746974792e6d6a73223a2230306438653939383330393261636430623339653338643939376632666164396234326361323432613034313561353463613162363766386161336139373036222c227175616c6974792f62726f777365722f63692d6964656e746974792e746573742e6d6a73223a2265626563643830623064313962656233343635323137366463663465343936393539333639383961656431373237336130386430656238306336643965383636222c227175616c6974792f62726f777365722f63692d7072656c6f61642d636865636b732e6d6a73223a2264643265663463633266643431373834316631356362343033346162336535386464353963326332326465326332646466383934336332373933623964663838222c227175616c6974792f62726f777365722f63692d7072656c6f61642d676174652e746573742e6d6a73223a2232333463306539393336663736383734643430363931616163626535343362343662333163623538373232656337373539666463666136363834363865653865222c227175616c6974792f62726f777365722f63692d7072656c6f61642e696e746567726174696f6e2e746573742e6d6a73223a2261653032343136373939386539303432366334313962613863653165346631383134303366653833643431343039663436353638643734646365636232653031222c227175616c6974792f62726f777365722f6f776e65642d636c65616e75702e746573742e7473223a2238323233323234636431303732373631393739393432373636623538383730396536323432393964616261623735383739666365303539396565623834356262222c227175616c6974792f62726f777365722f6f776e65642d636c65616e75702e7473223a2232663038376639303335333065613933393639316361323163663034646164323835653636393263656131636664323033393136636534643231333064306332222c227175616c6974792f62726f777365722f7061636b6167652d6c6f636b2e6a736f6e223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c227175616c6974792f62726f777365722f7061636b6167652e6a736f6e223a2262633835616162326665363263383663643737336533336531646464663765643666653536376337353966303262653166353730393965366261333864343164222c227175616c6974792f62726f777365722f706c61797772696768742e63692e636f6e6669672e7473223a2230396230643131363837303865643531316633373163396663326432393363323930653931663034646237623262383838383363626531393437333361386634222c227175616c6974792f62726f777365722f706c61797772696768742e636f6e6669672e7473223a2262626261653066333365663266663035333738353135643130663662386165613362643131373238396337623961356161393232653935653861663832363965222c227175616c6974792f62726f777365722f756e69742d7265706f727465722e6d6a73223a2266663265616335663666366531646331363538326361646431643061396638363162326439643838323366366566346661346139353962363331396536383139222c2272657167756172642f6d61696e2e7079223a2265636334333963376363363832643339623464333239313366336561613333653362383739393666313264306362393565643265663532653663306165656661222c2272657167756172642f70657273697374656e63652e7079223a2237363764306339333466626133333137663438343739326636323334316235393933643331303230383638346262646532326465383437323233643033383931222c2272657167756172642f7374617469632f6170702e6d6a73223a2265653264393264373530623538653230663838363264353335653462316639373962613537636563653834623436646536333436333934326434383837303962222c2272657167756172642f7374617469632f696e6465782e68746d6c223a2238656231306133636539353163643938643066653766326165663062383966333865333538656232343030633166666639306362653365643631666436633234222c2272657167756172642f7374617469632f7374796c652e637373223a2238306237613538383633313732623730666462323361303936373263396565366137363161666231643135343063653937343664633034363435616138303236222c22736372697074732f72673036645f61646d697373696f6e2e7079223a2235343131663436666134386637623731353064343738376634623030393163633534366533633166333566303934613935333265393730613666626666643363222c22736372697074732f72756e5f72673036645f63692e7079223a2231326165636233363766393662363466373562396236396266343361376338303931666665393864383038633230613535366462323139343434656662303038222c22736372697074732f746573745f72673036645f61646d697373696f6e2e7079223a2266396538306162343763353832306237383436656635353930313132393530303230306437383662643735346139363434323533313333366236636466616539222c2275762e6c6f636b223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161227d2c226e6f64655f6c6f636b5f736861323536223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c2270725f626173655f736861223a6e756c6c2c2270725f686561645f736861223a6e756c6c2c22707974686f6e5f6c6f636b5f736861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227465737465645f6d657267655f736861223a6e756c6c7d",
+      "sha256": "5733e5611cf9cf222949bb16ad4c53d579f59a86acaeb27521038ab288b5c959",
+      "byte_length": 2824
+    },
+    {
+      "id": "V03_UNSORTED_NESTED_INPUTS",
+      "valid": true,
+      "validity_note": "Validator-valid; deliberately unsorted nested keys, extra names not produced by fixed INPUTS",
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "z-path": "1111111111111111111111111111111111111111111111111111111111111111",
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "a-path": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "canonical_json": "{\"checkout_sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"github_run_attempt\":\"1\",\"github_run_id\":\"123\",\"inputs\":{\"a-path\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"quality/browser/package-lock.json\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"uv.lock\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"z-path\":\"1111111111111111111111111111111111111111111111111111111111111111\"},\"node_lock_sha256\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"pr_base_sha\":null,\"pr_head_sha\":null,\"python_lock_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tested_merge_sha\":null}",
+      "canonical_hex": "7b22636865636b6f75745f736861223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262222c226769746875625f72756e5f617474656d7074223a2231222c226769746875625f72756e5f6964223a22313233222c22696e70757473223a7b22612d70617468223a2232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232222c227175616c6974792f62726f777365722f7061636b6167652d6c6f636b2e6a736f6e223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c2275762e6c6f636b223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227a2d70617468223a2231313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131227d2c226e6f64655f6c6f636b5f736861323536223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c2270725f626173655f736861223a6e756c6c2c2270725f686561645f736861223a6e756c6c2c22707974686f6e5f6c6f636b5f736861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227465737465645f6d657267655f736861223a6e756c6c7d",
+      "sha256": "f52c069baa5c4a3c0d16cd89f858b489f48760091c70e6d151655b718a9e0d5d",
+      "byte_length": 685
+    },
+    {
+      "id": "V04_PR_NON_NULL",
+      "valid": true,
+      "validity_note": "PR-shaped source with three SHA fields non-null, valid under validator",
+      "source": {
+        "checkout_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "pr_head_sha": "dddddddddddddddddddddddddddddddddddddddd",
+        "pr_base_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "tested_merge_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "quality/browser/ci-preload-gate.test.mjs": "234c0e9936f76874d40691aacbe543b46b31cb58722ec7759fdcfa668468ee8e",
+          "quality/browser/ci-preload-checks.mjs": "dd2ef4cc2fd417841f15cb4034ab3e58dd59c2c22de2c2ddf8943c2793b9df88",
+          "quality/browser/ci-preload.integration.test.mjs": "ae024167998e90426c419ba8ce1e4f181403fe83d41409f46568d74dcecb2e01",
+          "quality/browser/ci-identity.test.mjs": "ebecd80b0d19beb34652176dcf4e49695936989aed17273a08d0eb80c6d9e866",
+          "scripts/test_rg06d_admission.py": "f9e80ab47c5820b7846ef55901129500200d786bd754a96442531336b6cdfae9",
+          "scripts/rg06d_admission.py": "5411f46fa48f7b7150d4787f4b0091cc546e3c1f35f094a9532e970a6fbffd3c",
+          "quality/browser/unit-reporter.mjs": "ff2eac5f6f6e1dc16582cadd1d0a9f861b2d9d8823f6ef4fa4a959b6319e6819",
+          "quality/browser/ci-identity.mjs": "00d8e9983092acd0b39e38d997f2fad9b42ca242a0415a54ca1b67f8aa3a9706",
+          "quality/browser/owned-cleanup.test.ts": "8223224cd1072761979942766b588709e624299dabab75879fce0599eeb845bb",
+          "quality/browser/owned-cleanup.ts": "2f087f903530ea939691ca21cf04dad285e6692cea1cfd203916ce4d2130d0c2",
+          ".github/workflows/rg06d-e2e.yml": "672638670570967088ecd3e6f73182cefeb7c8a52d5a0a58b6dffa5e243b0eb9",
+          "scripts/run_rg06d_ci.py": "12aecb367f96b64f75b9b69bf43a7c8091ffe98d808c20a556db219444efb008",
+          "quality/browser/playwright.ci.config.ts": "09b0d1168708ed511f371c9fc2d293c290e91f04db7b2b88883cbe194733a8f4",
+          "quality/browser/playwright.config.ts": "bbbae0f33ef2ff05378515d10f6b8aea3bd117289c7b9a5aa922e95e8af8269e",
+          "quality/browser/analyses.spec.ts": "a6af1d5f44e122fd7f0f2e25a329f2a4fdb210aa2852651adafd2ae56ab85365",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "quality/browser/package.json": "bc85aab2fe62c86cd773e33e1dddf7ed6fe567c759f02be1f57099e6ba38d41d",
+          "reqguard/static/style.css": "80b7a58863172b70fdb23a09672c9ee6a761afb1d1540ce9746dc04645aa8026",
+          "reqguard/static/app.mjs": "ee2d92d750b58e20f8862d535e4b1f979ba57cece84b46de63463942d488709b",
+          "reqguard/static/index.html": "8eb10a3ce951cd98d0fe7f2aef0b89f38e358eb2400c1fff90cbe3ed61fd6c24",
+          "reqguard/persistence.py": "767d0c934fba3317f484792f62341b5993d310208684bbde22de847223d03891",
+          "reqguard/main.py": "ecc439c7cc682d39b4d32913f3eaa33e3b87996f12d0cb95ed2ef52e6c0aeefa",
+          "db/001_init.sql": "d0c07dfc5aa7a23362e2f3fbdefaabd07618deb280eb9b9411f5b37af69a9e0f",
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "pyproject.toml": "50c86b7ed8ac2cf95bd48334961bf0530cdc77b5a56f852c5c61b89d735fd711"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "canonical_json": "{\"checkout_sha\":\"cccccccccccccccccccccccccccccccccccccccc\",\"github_run_attempt\":\"1\",\"github_run_id\":\"123\",\"inputs\":{\".github/workflows/rg06d-e2e.yml\":\"672638670570967088ecd3e6f73182cefeb7c8a52d5a0a58b6dffa5e243b0eb9\",\"db/001_init.sql\":\"d0c07dfc5aa7a23362e2f3fbdefaabd07618deb280eb9b9411f5b37af69a9e0f\",\"pyproject.toml\":\"50c86b7ed8ac2cf95bd48334961bf0530cdc77b5a56f852c5c61b89d735fd711\",\"quality/browser/analyses.spec.ts\":\"a6af1d5f44e122fd7f0f2e25a329f2a4fdb210aa2852651adafd2ae56ab85365\",\"quality/browser/ci-identity.mjs\":\"00d8e9983092acd0b39e38d997f2fad9b42ca242a0415a54ca1b67f8aa3a9706\",\"quality/browser/ci-identity.test.mjs\":\"ebecd80b0d19beb34652176dcf4e49695936989aed17273a08d0eb80c6d9e866\",\"quality/browser/ci-preload-checks.mjs\":\"dd2ef4cc2fd417841f15cb4034ab3e58dd59c2c22de2c2ddf8943c2793b9df88\",\"quality/browser/ci-preload-gate.test.mjs\":\"234c0e9936f76874d40691aacbe543b46b31cb58722ec7759fdcfa668468ee8e\",\"quality/browser/ci-preload.integration.test.mjs\":\"ae024167998e90426c419ba8ce1e4f181403fe83d41409f46568d74dcecb2e01\",\"quality/browser/owned-cleanup.test.ts\":\"8223224cd1072761979942766b588709e624299dabab75879fce0599eeb845bb\",\"quality/browser/owned-cleanup.ts\":\"2f087f903530ea939691ca21cf04dad285e6692cea1cfd203916ce4d2130d0c2\",\"quality/browser/package-lock.json\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"quality/browser/package.json\":\"bc85aab2fe62c86cd773e33e1dddf7ed6fe567c759f02be1f57099e6ba38d41d\",\"quality/browser/playwright.ci.config.ts\":\"09b0d1168708ed511f371c9fc2d293c290e91f04db7b2b88883cbe194733a8f4\",\"quality/browser/playwright.config.ts\":\"bbbae0f33ef2ff05378515d10f6b8aea3bd117289c7b9a5aa922e95e8af8269e\",\"quality/browser/unit-reporter.mjs\":\"ff2eac5f6f6e1dc16582cadd1d0a9f861b2d9d8823f6ef4fa4a959b6319e6819\",\"reqguard/main.py\":\"ecc439c7cc682d39b4d32913f3eaa33e3b87996f12d0cb95ed2ef52e6c0aeefa\",\"reqguard/persistence.py\":\"767d0c934fba3317f484792f62341b5993d310208684bbde22de847223d03891\",\"reqguard/static/app.mjs\":\"ee2d92d750b58e20f8862d535e4b1f979ba57cece84b46de63463942d488709b\",\"reqguard/static/index.html\":\"8eb10a3ce951cd98d0fe7f2aef0b89f38e358eb2400c1fff90cbe3ed61fd6c24\",\"reqguard/static/style.css\":\"80b7a58863172b70fdb23a09672c9ee6a761afb1d1540ce9746dc04645aa8026\",\"scripts/rg06d_admission.py\":\"5411f46fa48f7b7150d4787f4b0091cc546e3c1f35f094a9532e970a6fbffd3c\",\"scripts/run_rg06d_ci.py\":\"12aecb367f96b64f75b9b69bf43a7c8091ffe98d808c20a556db219444efb008\",\"scripts/test_rg06d_admission.py\":\"f9e80ab47c5820b7846ef55901129500200d786bd754a96442531336b6cdfae9\",\"uv.lock\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"node_lock_sha256\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"pr_base_sha\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"pr_head_sha\":\"dddddddddddddddddddddddddddddddddddddddd\",\"python_lock_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tested_merge_sha\":\"cccccccccccccccccccccccccccccccccccccccc\"}",
+      "canonical_hex": "7b22636865636b6f75745f736861223a2263636363636363636363636363636363636363636363636363636363636363636363636363636363222c226769746875625f72756e5f617474656d7074223a2231222c226769746875625f72756e5f6964223a22313233222c22696e70757473223a7b222e6769746875622f776f726b666c6f77732f72673036642d6532652e796d6c223a2236373236333836373035373039363730383865636433653666373331383263656665623763386135326435613061353862366466666135653234336230656239222c2264622f3030315f696e69742e73716c223a2264306330376466633561613761323333363265326633666264656661616264303736313864656232383065623962393431316635623337616636396139653066222c22707970726f6a6563742e746f6d6c223a2235306338366237656438616332636639356264343833333439363162663035333063646337376235613536663835326335633631623839643733356664373131222c227175616c6974792f62726f777365722f616e616c797365732e737065632e7473223a2261366166316435663434653132326664376630663265323561333239663261346664623231306161323835323635316164616664326165353661623835333635222c227175616c6974792f62726f777365722f63692d6964656e746974792e6d6a73223a2230306438653939383330393261636430623339653338643939376632666164396234326361323432613034313561353463613162363766386161336139373036222c227175616c6974792f62726f777365722f63692d6964656e746974792e746573742e6d6a73223a2265626563643830623064313962656233343635323137366463663465343936393539333639383961656431373237336130386430656238306336643965383636222c227175616c6974792f62726f777365722f63692d7072656c6f61642d636865636b732e6d6a73223a2264643265663463633266643431373834316631356362343033346162336535386464353963326332326465326332646466383934336332373933623964663838222c227175616c6974792f62726f777365722f63692d7072656c6f61642d676174652e746573742e6d6a73223a2232333463306539393336663736383734643430363931616163626535343362343662333163623538373232656337373539666463666136363834363865653865222c227175616c6974792f62726f777365722f63692d7072656c6f61642e696e746567726174696f6e2e746573742e6d6a73223a2261653032343136373939386539303432366334313962613863653165346631383134303366653833643431343039663436353638643734646365636232653031222c227175616c6974792f62726f777365722f6f776e65642d636c65616e75702e746573742e7473223a2238323233323234636431303732373631393739393432373636623538383730396536323432393964616261623735383739666365303539396565623834356262222c227175616c6974792f62726f777365722f6f776e65642d636c65616e75702e7473223a2232663038376639303335333065613933393639316361323163663034646164323835653636393263656131636664323033393136636534643231333064306332222c227175616c6974792f62726f777365722f7061636b6167652d6c6f636b2e6a736f6e223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c227175616c6974792f62726f777365722f7061636b6167652e6a736f6e223a2262633835616162326665363263383663643737336533336531646464663765643666653536376337353966303262653166353730393965366261333864343164222c227175616c6974792f62726f777365722f706c61797772696768742e63692e636f6e6669672e7473223a2230396230643131363837303865643531316633373163396663326432393363323930653931663034646237623262383838383363626531393437333361386634222c227175616c6974792f62726f777365722f706c61797772696768742e636f6e6669672e7473223a2262626261653066333365663266663035333738353135643130663662386165613362643131373238396337623961356161393232653935653861663832363965222c227175616c6974792f62726f777365722f756e69742d7265706f727465722e6d6a73223a2266663265616335663666366531646331363538326361646431643061396638363162326439643838323366366566346661346139353962363331396536383139222c2272657167756172642f6d61696e2e7079223a2265636334333963376363363832643339623464333239313366336561613333653362383739393666313264306362393565643265663532653663306165656661222c2272657167756172642f70657273697374656e63652e7079223a2237363764306339333466626133333137663438343739326636323334316235393933643331303230383638346262646532326465383437323233643033383931222c2272657167756172642f7374617469632f6170702e6d6a73223a2265653264393264373530623538653230663838363264353335653462316639373962613537636563653834623436646536333436333934326434383837303962222c2272657167756172642f7374617469632f696e6465782e68746d6c223a2238656231306133636539353163643938643066653766326165663062383966333865333538656232343030633166666639306362653365643631666436633234222c2272657167756172642f7374617469632f7374796c652e637373223a2238306237613538383633313732623730666462323361303936373263396565366137363161666231643135343063653937343664633034363435616138303236222c22736372697074732f72673036645f61646d697373696f6e2e7079223a2235343131663436666134386637623731353064343738376634623030393163633534366533633166333566303934613935333265393730613666626666643363222c22736372697074732f72756e5f72673036645f63692e7079223a2231326165636233363766393662363466373562396236396266343361376338303931666665393864383038633230613535366462323139343434656662303038222c22736372697074732f746573745f72673036645f61646d697373696f6e2e7079223a2266396538306162343763353832306237383436656635353930313132393530303230306437383662643735346139363434323533313333366236636466616539222c2275762e6c6f636b223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161227d2c226e6f64655f6c6f636b5f736861323536223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c2270725f626173655f736861223a2265656565656565656565656565656565656565656565656565656565656565656565656565656565222c2270725f686561645f736861223a2264646464646464646464646464646464646464646464646464646464646464646464646464646464222c22707974686f6e5f6c6f636b5f736861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227465737465645f6d657267655f736861223a2263636363636363636363636363636363636363636363636363636363636363636363636363636363227d",
+      "sha256": "a88e6f10b78b72bb62e91bef6bb06f01f92e5d0e777d33a9b65868b34808a319",
+      "byte_length": 2938
+    },
+    {
+      "id": "V05_NULLABLE_NON_PR",
+      "valid": true,
+      "validity_note": "All PR SHA nullable fields explicitly null",
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "2",
+        "inputs": {
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "canonical_json": "{\"checkout_sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"github_run_attempt\":\"2\",\"github_run_id\":\"123\",\"inputs\":{\"quality/browser/package-lock.json\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"uv.lock\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"node_lock_sha256\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"pr_base_sha\":null,\"pr_head_sha\":null,\"python_lock_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tested_merge_sha\":null}",
+      "canonical_hex": "7b22636865636b6f75745f736861223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262222c226769746875625f72756e5f617474656d7074223a2232222c226769746875625f72756e5f6964223a22313233222c22696e70757473223a7b227175616c6974792f62726f777365722f7061636b6167652d6c6f636b2e6a736f6e223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c2275762e6c6f636b223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161227d2c226e6f64655f6c6f636b5f736861323536223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c2270725f626173655f736861223a6e756c6c2c2270725f686561645f736861223a6e756c6c2c22707974686f6e5f6c6f636b5f736861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227465737465645f6d657267655f736861223a6e756c6c7d",
+      "sha256": "fdc0c1e61bb192646de6af38a39db10555214f2683b0b470026c042f927a3bc8",
+      "byte_length": 533
+    }
+  ],
+  "invalid_vectors": [
+    {
+      "id": "X01_EMPTY_INPUTS",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {},
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "validate_source: SOURCE_INPUTS",
+      "rejection_reason": "inputs must be nonempty"
+    },
+    {
+      "id": "X02_UNICODE_INPUT_NAME",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "\u00e9.txt": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "child producer-domain allowlist; NOT current validate_source",
+      "rejection_reason": "passes current validate_source but impossible from fixed ASCII INPUTS producer; proposed child producer-domain rejects it"
+    },
+    {
+      "id": "X03_UNICODE_INPUT_NAME_NONBMP",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "\ud83d\ude00": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "child producer-domain allowlist; NOT current validate_source",
+      "rejection_reason": "passes current validate_source but impossible from fixed ASCII INPUTS producer; proposed child producer-domain rejects it"
+    },
+    {
+      "id": "X04_UNICODE_RUN_STRING",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "\uff11\uff12\uff13",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "validate_source: SOURCE_RUN",
+      "rejection_reason": "run must be ASCII positive decimal"
+    },
+    {
+      "id": "X05_NUMERIC_RUN",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": 123,
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "validate_source: SOURCE_RUN",
+      "rejection_reason": "run ID is string not number"
+    },
+    {
+      "id": "X06_BOOLEAN_ATTEMPT",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": true,
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "validate_source: SOURCE_RUN",
+      "rejection_reason": "bool not accepted"
+    },
+    {
+      "id": "X07_NUMERIC_INPUT_HASH",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": 42,
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "validate_source: SOURCE_HASH",
+      "rejection_reason": "hash must be string"
+    },
+    {
+      "id": "X08_BOOLEAN_SHA",
+      "valid": false,
+      "source": {
+        "checkout_sha": false,
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "validate_source: SOURCE_SHA",
+      "rejection_reason": "SHA must be string"
+    },
+    {
+      "id": "X09_ALTERED_INPUT_DIGEST",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "9999999999999999999999999999999999999999999999999999999999999999",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "validate_source: SOURCE_LOCK",
+      "rejection_reason": "stale lock alias mismatches inputs"
+    },
+    {
+      "id": "X10_ALTERED_CHECKOUT_SHA",
+      "valid": false,
+      "source": {
+        "checkout_sha": "9999999999999999999999999999999999999999",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "independent run/source binding; NOT shape validation",
+      "rejection_reason": "structurally valid standalone source; reject against independently verified checkout SHA and expected parent digest"
+    },
+    {
+      "id": "X11_EXTRA_FIELD",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "unexpected": "value"
+      },
+      "rejection_stage": "validate_source: ADMISSION_FIELDS",
+      "rejection_reason": "exact keyset required"
+    },
+    {
+      "id": "X12_MISSING_FIELD",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "rejection_stage": "validate_source: ADMISSION_FIELDS",
+      "rejection_reason": "exact keyset required"
+    },
+    {
+      "id": "X13_EMPTY_NODE_HASH",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": null,
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": ""
+      },
+      "rejection_stage": "validate_source: SOURCE_LOCK",
+      "rejection_reason": "node lock must match input lock"
+    },
+    {
+      "id": "X14_PR_SHA_INCONSISTENCY",
+      "valid": false,
+      "source": {
+        "checkout_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pr_head_sha": "dddddddddddddddddddddddddddddddddddddddd",
+        "pr_base_sha": null,
+        "tested_merge_sha": null,
+        "github_run_id": "123",
+        "github_run_attempt": "1",
+        "inputs": {
+          "uv.lock": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "quality/browser/package-lock.json": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "python_lock_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "node_lock_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "rejection_stage": "validate_source: SOURCE_PR",
+      "rejection_reason": "PR SHA pair required"
+    }
+  ]
+}
+'''
+)
+
+
+class NetworkV3Tests(unittest.TestCase):
+    setUp = FirstErrorV2Tests.setUp
+    tracker = FirstErrorV2Tests.tracker
+    value = FirstErrorV2Tests.value
+    caught = FirstErrorV2Tests.caught
+    classify = FirstErrorV2Tests.classify
+    local_publish = FirstErrorV2Tests.local_publish
+    pg_run = FirstErrorV2Tests.pg_run
+    tearDown_fixture = FirstErrorV2Tests.tearDown_fixture
+
+    def receipt(self):
+        return {'schema_version': 'rg06d-service-v3', 'run_id': RUN, 'source_identity': copy.deepcopy(self.source),
+                'container_id': 'e' * 64, 'engine_id': 'synthetic-engine', 'endpoint': 'unix:///var/run/docker.sock',
+                'image': ci.IMAGE, 'image_id': 'sha256:' + 'e' * 64, 'network_reference': 'f' * 64,
+                'network_name': 'job', 'network_id': 'f' * 64, 'attachment_network_name': 'job',
+                'attachment_network_id': 'f' * 64, 'host_port': '49123', 'fingerprint': dict(FP),
+                'service_observation': {**FP, 'address': '127.0.0.1', 'port': 5432, 'backend_pid': 99},
+                'host_path': dict(SERVER_PATH), 'host_target': dict(TARGET),
+                'published_bindings': [{'HostIp': '0.0.0.0', 'HostPort': '49123'}]}
+
+    def env(self, artifact):
+        # Expectations precede receipt serialization and are never read from receipt.
+        return {**os.environ, **ENV, 'GITHUB_SHA': self.source['checkout_sha'],
+                'RG06D_EXPECTED_SOURCE_IDENTITY_SHA256': hashlib.sha256(a.canonical_source_bytes(self.source)).hexdigest(),
+                'RG06B_ARTIFACT': str(artifact), 'RG06D_NODE_IDENTITY': '1', 'RG06B_API_PORT': '49124'}
+
+    def node(self, expression, value):
+        program = 'import * as m from ' + json.dumps(Path(ci.PACKAGE / 'ci-identity.mjs').as_uri()) + ';' + \
+                  'let text=""; for await(const b of process.stdin)text+=b; const x=JSON.parse(text);' + expression
+        env = {**os.environ, 'RG06D_NODE_IDENTITY': '0'}
+        result = subprocess.run(['node', '--input-type=module', '-e', program], input=encoded(value),
+                                capture_output=True, env=env, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+        return json.loads(result.stdout)
+
+    def produce(self, reference='f' * 64, net=None, change=None, raw=None, failure=None, image_change=None):
+        container = {'Id': 'e' * 64, 'Image': 'sha256:' + 'e' * 64,
+                     'State': {'Running': True, 'Health': {'Status': 'healthy'}},
+                     'Mounts': [{'Type': 'volume', 'Destination': '/var/lib/postgresql/data'}],
+                     'NetworkSettings': {'Networks': {'job': {'NetworkID': 'f' * 64, 'IPAddress': '172.18.0.2'}},
+                                         'Ports': {'5432/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '49123'}]}}}
+        if change: change(container)
+        image = {'Id': 'sha256:' + 'e' * 64, 'Os': 'linux', 'Architecture': 'amd64', 'RepoDigests': [ci.IMAGE]}
+        if image_change: image_change(image)
+        calls = []
+        def output(argv):
+            calls.append(argv)
+            if argv[1:3] == ['context', 'show']: return 'default'
+            if argv[1:3] == ['context', 'inspect']: return 'unix:///var/run/docker.sock'
+            if 'info' in argv: return 'synthetic-engine'
+            if 'network' in argv:
+                if failure: raise failure
+                return raw if raw is not None else json.dumps(net or {'Id': 'f' * 64, 'Name': 'job'})
+            if 'image' in argv: return json.dumps(image)
+            if 'exec' in argv: return json.dumps({**FP, 'address': '127.0.0.1', 'port': 5432, 'backend_pid': 99})
+            return json.dumps(container)
+        env = {**ENV, 'RG06D_RUNNER_ENV': 'github-hosted', 'RG06D_SERVICE_NETWORK': reference}
+        for key in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CERT_PATH', 'DOCKER_TLS_VERIFY'): env[key] = ''
+        self.inspect_calls = calls
+        with patch.object(ci.os, 'environ', env), patch.object(ci, 'output', side_effect=output):
+            return ci.service_admission(self.raw, self.source)
+
+    def child(self, language, raw=None, env_change=None, backend='good', bad_directory=False, symlink_receipt=False):
+        root = self.directory / 'isolated-child'; here = root / 'quality/browser'; here.mkdir(parents=True, exist_ok=True)
+        scripts = root / 'scripts'; scripts.mkdir(exist_ok=True)
+        module = here / 'ci-identity.mjs'; module.write_bytes((ci.PACKAGE / 'ci-identity.mjs').read_bytes())
+        api = scripts / 'rg06d_admission.py'; api.write_bytes(Path(a.__file__).read_bytes())
+        artifact = here / '.artifacts' / RUN; artifact.mkdir(parents=True, exist_ok=True)
+        env = self.env(artifact)
+        if env_change: env_change(env)
+        if bad_directory: env['RG06B_ARTIFACT'] = str(self.directory)
+        data = encoded(self.receipt()) if raw is None else raw
+        (artifact / 'service-identity.json').write_bytes(data)
+        if symlink_receipt:
+            (artifact / 'service-identity.json').rename(artifact / 'owned-receipt.json')
+            (artifact / 'service-identity.json').symlink_to(artifact / 'owned-receipt.json')
+        counter = self.directory / ('counter-' + str(len(list(self.directory.glob('counter-*')))) + '.json')
+        env.update(RG06D_OBSERVER_FILE=str(counter), RG06D_OBSERVER_BACKEND=backend)
+        if language == 'node':
+            stub = r"""
+              const s=globalThis[Symbol.for('rg06d.observer')];
+              class Client {
+                constructor(){s.client_constructed++;this.connectionParameters={host:'127.0.0.1',port:49123};}
+                connect(cb){s.connect_calls++;s.events.push('CONNECT');if(cb){queueMicrotask(()=>cb(null));return;}return Promise.resolve();}
+                async query(sql){s.query_calls++;if(sql==='INSERT synthetic'){s.insert_calls++;s.events.push('INSERT');return;}
+                  s.events.push('IDENTITY');return {rows:[{db:'reqguard_rg06b',role:'reqguard_rg06b',version:'170011',system_id:process.env.RG06D_OBSERVER_BACKEND==='bad'?'999':'1234567',address:'172.18.0.2',port:5432,backend_pid:123}]};}
+                async end(){s.closed++;}
+              }
+              export default {Client};
+            """
+            observer = r"""
+              import fs from 'node:fs';import {registerHooks} from 'node:module';
+              const s={observer_ready:1,pg_import_attempts:0,client_constructed:0,connect_calls:0,query_calls:0,insert_calls:0,closed:0,callbacks:0,events:[]};
+              globalThis[Symbol.for('rg06d.observer')]=s;
+              process.on('exit',()=>fs.writeFileSync(process.env.RG06D_OBSERVER_FILE,JSON.stringify(s)));
+              registerHooks({resolve(spec,context,next){if(spec==='pg'){s.pg_import_attempts++;s.events.push('IMPORT');return {url:STUB_URL,shortCircuit:true};}return next(spec,context);}});
+            """.replace('STUB_URL', json.dumps('data:text/javascript,' + urllib.parse.quote(stub, safe='')))
+            program = r"""
+              import pg from 'pg';import assert from 'node:assert/strict';
+              const s=globalThis[Symbol.for('rg06d.observer')];
+              assert.equal(pg.Client.prototype.connect[Symbol.for('reqguard.ci.identity-hook')],true);
+              const c=new pg.Client();
+              if(process.env.RG06D_OBSERVER_BACKEND==='bad') {
+                await assert.rejects(c.connect(),/IDENTITY_REJECTED/);
+                const d=new pg.Client();await new Promise(resolve=>d.connect(e=>{s.callbacks++;assert.match(e.message,/IDENTITY_REJECTED/);resolve();}));
+              } else {await c.connect();assert.ok(s.query_calls>0);await c.query('INSERT synthetic');}
+            """
+            argv = ['node', '--no-warnings', '--import=data:text/javascript,' + urllib.parse.quote(observer, safe=''),
+                    '--import=' + module.as_uri(), '--input-type=module', '-e', program]
+        else:
+            wrapper = r"""
+import sys,os,runpy,json,importlib.abc,importlib.util,types
+s={'observer_ready':1,'psycopg_import_attempts':0,'client_constructed':0,'connect_calls':0,'execute_calls':0,'insert_calls':0,'closed':0,'events':[]}
+class Connection:
+ def __init__(self):s['client_constructed']+=1;self.info=types.SimpleNamespace(transaction_status=0,host='127.0.0.1',port=49123);self.autocommit=False
+ def transaction(self):
+  c=self
+  class Tx:
+   def __enter__(self):c.info.transaction_status=2
+   def __exit__(self,*a):c.info.transaction_status=0
+  return Tx()
+ def execute(self,sql):
+  s['execute_calls']+=1
+  if sql=='INSERT synthetic':s['insert_calls']+=1;s['events'].append('INSERT')
+ def cursor(self):
+  class Cursor:
+   def __enter__(self):return self
+   def __exit__(self,*a):pass
+   def execute(self,sql):s['execute_calls']+=1;s['events'].append('IDENTITY')
+   def fetchone(self):return ('reqguard_rg06b','reqguard_rg06b','170011','999' if os.environ['RG06D_OBSERVER_BACKEND']=='bad' else '1234567','172.18.0.2',5432,123)
+  return Cursor()
+ def close(self):s['closed']+=1
+class Observer(importlib.abc.MetaPathFinder,importlib.abc.Loader):
+ def find_spec(self,name,path=None,target=None):
+  if name not in ('psycopg','uvicorn'):return None
+  if name=='psycopg':s['psycopg_import_attempts']+=1;s['events'].append('IMPORT')
+  return importlib.util.spec_from_loader(name,self)
+ def create_module(self,spec):return None
+ def exec_module(self,module):
+  if module.__name__=='psycopg':
+   def connect(*a,**kw):s['connect_calls']+=1;s['events'].append('CONNECT');return Connection()
+   module.connect=connect
+  else:
+   def run(*a,**kw):
+    import psycopg
+    try:c=psycopg.connect();c.execute('INSERT synthetic')
+    except Exception:
+     s['denied']=True
+     if os.environ['RG06D_OBSERVER_BACKEND']!='bad':raise
+   module.run=run
+sys.meta_path.insert(0,Observer());code=0
+try:runpy.run_path(sys.argv[1],run_name='__main__')
+except SystemExit as error:code=error.code or 0
+except Exception as error:s['observer_error']=type(error).__name__;code=2
+finally:
+ with open(os.environ['RG06D_OBSERVER_FILE'],'w') as f:json.dump(s,f)
+sys.exit(code)
+"""
+            argv = [sys.executable, '-B', '-c', wrapper, str(api)]
+        result = subprocess.run(argv, env=env, capture_output=True, timeout=20)
+        self.assertTrue(counter.is_file(), result.stderr.decode(errors='replace'))
+        counts = json.loads(counter.read_text()); self.assertEqual(counts['observer_ready'], 1)
+        report = {'language':language,'argv':argv,'exit_code':result.returncode,'receipt_bytes':len(data),
+                  'receipt_sha256':hashlib.sha256(data).hexdigest(),'expected_env':{k:env.get(k) for k in a.CHILD_EXPECTATIONS},
+                  'counters':counts,'stdout':result.stdout.decode(errors='replace'),'stderr':result.stderr.decode(errors='replace'),
+                  'actual_entrypoint_source_sha256':hashlib.sha256((module if language=='node' else api).read_bytes()).hexdigest()}
+        evidence = os.environ.get('RG06D_LOCAL_EVIDENCE')
+        if evidence:
+            dest=Path(evidence);number=len(list(dest.glob('denial-*.json')))
+            (dest/f'denial-{number:04d}.json').write_text(json.dumps(report,indent=2))
+            (dest/f'fixture-{number:04d}.bin').write_bytes(data)
+        return result,counts
+
+    def denied(self, raw=None, env_change=None, bad_directory=False):
+        for language in ('node','python'):
+            result,c=self.child(language,raw,env_change,bad_directory=bad_directory)
+            self.assertNotEqual(result.returncode,0,language)
+            self.assertEqual(c['pg_import_attempts' if language=='node' else 'psycopg_import_attempts'],0)
+            for key in ('connect_calls','query_calls' if language=='node' else 'execute_calls','insert_calls'):self.assertEqual(c[key],0)
+            self.assertNotIn(b'CONTROLLED_SECRET',result.stdout+result.stderr)
+            marker=b'RG06D_NODE_RECEIPT_REJECTED' if language=='node' else b'RG06D_API_RECEIPT_REJECTED'
+            self.assertEqual(result.stderr.strip(),marker)
+
+    def test_N01_name_resolution(self):
+        value=self.produce(reference='github_network_fixture',net={'Id':'f'*64,'Name':'github_network_fixture'},
+            change=lambda c:c['NetworkSettings'].update(Networks={'github_network_fixture':{'NetworkID':'f'*64,'IPAddress':'172.18.0.2'}}))
+        self.assertEqual(value['network_reference'],'github_network_fixture');self.assertEqual(value['network_id'],'f'*64)
+        a.validate_service_receipt(value,RUN,self.source,{**ENV,'RG06D_SERVICE_NETWORK':'github_network_fixture'})
+        argv=next(x for x in self.inspect_calls if 'network' in x)
+        self.assertEqual(argv,['docker','--context','default','network','inspect','--format','{"Id":{{json .Id}},"Name":{{json .Name}}}','github_network_fixture'])
+    def test_N02_full_id(self):
+        value=self.produce();a.validate_service_receipt(value,RUN,self.source,ENV);self.assertEqual(value['network_name'],'job')
+    def test_N03_wrong_name(self):
+        with self.assertRaises(a.AdmissionError):self.produce(reference='github_wrong')
+    def test_N04_wrong_full_id(self):
+        with self.assertRaises(a.AdmissionError):self.produce(reference='9'*64)
+    def test_N05_wrong_attachment_id(self):
+        value=self.pg_run(change=lambda c:c['NetworkSettings']['Networks']['job'].update(NetworkID='9'*64))
+        self.assertEqual(value['first_admission_call_site'],'A.SVC.NETWORK_ID_SET')
+    def test_N06_wrong_key(self):
+        with self.assertRaises(a.AdmissionError):self.produce(change=lambda c:c['NetworkSettings'].update(Networks={'wrong':{'NetworkID':'f'*64,'IPAddress':'172.18.0.2'}}))
+    def test_N07_extra_attachment(self):
+        value=self.pg_run(change=lambda c:c['NetworkSettings']['Networks'].update(extra={'NetworkID':'f'*64,'IPAddress':'172.18.0.3'}))
+        self.assertEqual(value['first_admission_call_site'],'A.SVC.NETWORK_COUNT')
+    def test_N08_missing_attachments(self):
+        for value in ({},None,[],0):
+            with self.assertRaises(a.AdmissionError):self.produce(change=lambda c:c['NetworkSettings'].update(Networks=value))
+    def test_N09_malformed_attachment(self):
+        for value in ({},{'NetworkID':None},{'NetworkID':'a'*12},{'NetworkID':42},None):
+            with self.assertRaises(a.AdmissionError):self.produce(change=lambda c:c['NetworkSettings'].update(Networks={'job':value}))
+        for value in ({},None,[]):
+            with self.assertRaises(a.AdmissionError):self.produce(change=lambda c:c.update(NetworkSettings=value))
+    def test_N10_network_json(self):
+        for raw in ('{','[]','{}','"string"','{"Id":"x","Id":"y","Name":"job"}',json.dumps({'Id':'f'*64,'Name':'job','extra':1})):
+            with self.assertRaises(a.AdmissionError):self.produce(raw=raw)
+    def test_N11_ordered_classifier_zero_inspect(self):
+        cases=['a'*n for n in (12,32,63,64,65)]+['github_network_example','',' ','A'*64,None,1,[],True,'abc','a/b','job\n']
+        node=self.node('console.log(JSON.stringify(x.map(m.classifyNetworkReference)))',cases)
+        self.assertEqual(node,[a.classify_network_reference(x) for x in cases])
+        for value in cases:
+            if a.classify_network_reference(value)=='REJECT':
+                with self.assertRaises(a.AdmissionError):self.produce(reference=value)
+                self.assertEqual(self.inspect_calls,[])
+                with self.assertRaises(a.AdmissionError):a.validate_service_receipt(self.receipt(),RUN,self.source,{**ENV,'RG06D_SERVICE_NETWORK':value})
+    def test_N12_ambiguous_results(self):
+        for raw in ('','{} {}','[{"Id":"x","Name":"job"}]',json.dumps({'Id':'f'*12,'Name':'job'}),' '*65537):
+            with self.assertRaises(a.AdmissionError):self.produce(raw=raw)
+    def test_N13_service_identity_preserved(self):
+        for field,value in [('Id','9'*64),('Image','sha256:'+'9'*64)]:
+            with self.assertRaises(a.AdmissionError):self.produce(change=lambda c:c.update({field:value}))
+        with self.assertRaisesRegex(ci.Stop, '^SERVICE_IMAGE_DIGEST$'):
+            self.produce(image_change=lambda image:image.update(RepoDigests=[]))
+        value=self.pg_run(change=lambda c:c.update(Id='9'*64))
+        self.assertEqual(value['first_admission_call_site'],'A.SVC.IDENTITY')
+    def test_N14_subprocess_faults(self):
+        for error in (OSError('CONTROLLED_SECRET'),subprocess.TimeoutExpired(['docker'],15),subprocess.CalledProcessError(1,['docker'],output='CONTROLLED_SECRET')):
+            with self.assertRaises(type(error)):self.produce(failure=error)
+    def test_N15_publisher_tamper_limits(self):
+        for key,value in [('network_id','9'*64),('network_name','wrong'),('network_reference','wrong'),('attachment_network_id','9'*64),('attachment_network_name','wrong')]:
+            receipt=self.receipt();receipt[key]=value
+            with self.assertRaises(a.AdmissionError):a.validate_service_receipt(receipt,RUN,self.source,ENV)
+        receipt=self.receipt();receipt.update(network_reference='github_network_fixture',network_name='github_network_fixture',attachment_network_name='github_network_fixture')
+        env={**ENV,'RG06D_SERVICE_NETWORK':'github_network_fixture'};a.validate_service_receipt(receipt,RUN,self.source,env)
+        receipt.update(network_id='9'*64,attachment_network_id='9'*64)
+        # Deliberately demonstrate NOT DETECTABLE receipt-only coordinated Docker observation substitution.
+        a.validate_service_receipt(receipt,RUN,self.source,env)
+        receipt['network_reference']='github_other'
+        with self.assertRaises(a.AdmissionError):a.validate_service_receipt(receipt,RUN,self.source,env)
+    def test_N16_v2_diagnostic_no_raw_data(self):
+        value=self.pg_run(network_raw='{CONTROLLED_SECRET')
+        self.assertEqual(value['schema_version'],'rg06d-failure-diagnostic-v2');self.assertEqual(value['first_admission_call_site'],'UNRESOLVED')
+        self.assertNotIn('CONTROLLED_SECRET',json.dumps(value))
+    def test_N17_primary_survives_cleanup(self):
+        FirstErrorV2Tests.test_T02_cleanup_error_never_replaces_primary(self)
+    def test_N18_final_gate_fail_closed(self):
+        FirstErrorV2Tests.test_T15_diagnostic_cannot_turn_runtime_green(self)
+    def test_N19_stale_registry(self):
+        FirstErrorV2Tests.test_T08_registry_source_and_code_drift(self)
+    def test_N20_existing_gates(self):
+        FirstErrorV2Tests.test_T16_existing_gates_still_mandatory(self)
+        self.assertEqual(tuple(ci.INPUTS),a.SERVICE_INPUTS)
+
+    def test_M01_node_valid_preload(self):
+        result,c=self.child('node');self.assertEqual(result.returncode,0,result.stderr);self.assertGreater(c['pg_import_attempts'],0)
+        self.assertEqual(c['insert_calls'],1);self.assertLess(c['events'].index('IDENTITY'),c['events'].index('INSERT'))
+    def test_M02_python_api_valid(self):
+        result,c=self.child('python');self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(c['psycopg_import_attempts'],1)
+        self.assertEqual(c['insert_calls'],1);self.assertLess(c['events'].index('IDENTITY'),c['events'].index('INSERT'))
+    @unittest.skipUnless((ci.PACKAGE/'node_modules/pg/package.json').is_file(),'NOT_RUN_DEPENDENCY_UNAVAILABLE: actual locked pg preload')
+    def test_M03_real_locked_pg(self):
+        result=subprocess.run(['node','--test','quality/browser/ci-preload.integration.test.mjs'],env={**os.environ,'RG06D_REQUIRE_PG_PRELOAD_TEST':'1'},capture_output=True,timeout=40)
+        self.assertEqual(result.returncode,0,result.stderr)
+    def test_M04_no_v2(self):
+        for version in ('rg06d-service-v2','unknown',None,True):
+            receipt=self.receipt();receipt['schema_version']=version;self.denied(encoded(receipt))
+    def test_M05_strict_fields_and_parser(self):
+        for key in a.SERVICE_KEYS:
+            receipt=self.receipt();receipt.pop(key);self.denied(encoded(receipt))
+        receipt=self.receipt();receipt['extra']='CONTROLLED_SECRET';self.denied(encoded(receipt))
+    def test_M06_network_consistency(self):
+        for key in ('network_id','attachment_network_id','network_name','attachment_network_name'):
+            receipt=self.receipt();receipt[key]='9'*64 if key.endswith('_id') else 'wrong';self.denied(encoded(receipt))
+    def test_M07_coordinated_substitution_limit(self):
+        self.test_N15_publisher_tamper_limits()
+    def test_M08_independent_expectations(self):
+        for key,value in [('container_id','9'*64),('run_id','9'*32),('host_port','49124'),('network_reference','wrong')]:
+            receipt=self.receipt();receipt[key]=value;self.denied(encoded(receipt))
+        for key,value in [('checkout_sha','9'*40),('github_run_id','999'),('github_run_attempt','2')]:
+            receipt=self.receipt();receipt['source_identity'][key]=value;self.denied(encoded(receipt))
+    def test_M09_actual_entrypoints(self):
+        self.denied(b'{"CONTROLLED_SECRET":')
+        self.denied(bad_directory=True)
+    def test_M10_raw_safe_v3_publication(self):
+        EvidenceTests.test_publication_revalidates_copied_bundle(self)
+    def test_M11_diagnostic_immutable(self):
+        FirstErrorV2Tests.test_T01_repeated_first_and_mutable_source(self)
+    def test_M12_later_gate_still_fails(self):
+        self.test_N18_final_gate_fail_closed()
+
+    def test_D01_duplicate_version(self):
+        raw=encoded(self.receipt());self.denied(raw[:-1]+b',"schema_version":"rg06d-service-v3"}')
+    def test_D02_duplicate_reference(self):
+        raw=encoded(self.receipt());self.denied(raw[:-1]+b',"network_reference":"x"}')
+        self.denied(raw[:-1]+b',"network_reference":"'+b'f'*64+b'"}')
+    def test_D03_duplicate_source(self):
+        raw=encoded(self.receipt());self.denied(raw[:-1]+b',"source_identity":{}}')
+        self.denied(raw[:-1]+b',"source_identity":'+encoded(self.source)+b'}')
+    def test_D04_nested_source_duplicate(self):
+        raw=encoded(self.receipt()).replace(b'"github_run_id": "123"',b'"github_run_id":"123","github_run_id":"123"');self.denied(raw)
+    def test_D05_last_wins_container(self):
+        raw=encoded(self.receipt());self.denied(raw[:-1]+b',"container_id":"wrong"}')
+        self.denied(b'{"container_id":"wrong",'+raw[1:])
+    def test_D06_nested_and_escaped_duplicates(self):
+        raw=encoded(self.receipt()).replace(b'"network_reference"',b'"network_\\u0072eference"',1)
+        self.denied(raw[:-1]+b',"network_reference":"wrong"}')
+        self.denied(encoded(self.receipt())[:-1]+b',"unknown":{"x":1,"\\u0078":2}}')
+        raw=encoded(self.receipt()).replace(b'"backend_pid": 99',b'"backend_pid":99,"backend_pid":99')
+        self.denied(raw)
+    def test_D07_parser_limits(self):
+        values=[b'{',b'\xff',b'\xef\xbb\xbf{}',b' '*65537,b'{"x":"\\ud800"}',b'{"x":"\\udc00"}',b'{"x":"\\z"}',b'{"x":01}',b'{"x":1e}',b'{} {}']
+        for value in values:self.denied(value)
+        program='console.log(JSON.stringify(x.map(h=>{try{m.parseReceiptJson(Buffer.from(h,"hex"));return true}catch{return false}})))'
+        values=[b'['*33+b'0'+b']'*33,b'['+b'0,'*4200+b'0]']
+        self.assertEqual(self.node(program,[b.hex() for b in values]),[False,False])
+        for value in values:
+            result,c=self.child('node',value);self.assertNotEqual(result.returncode,0);self.assertEqual(c['pg_import_attempts'],0)
+        positive = [b'{}' + b' ' * 65534, b'[' * 32 + b'0' + b']' * 32,
+                    b'[' + b'0,' * 4094 + b'{}]']  # Exactly 8192 lexical tokens.
+        self.assertEqual(self.node(program,[b.hex() for b in positive]),[True,True,True])
+        rejected = [b'[' + b'0,' * 4095 + b'{}]', b'{"x":"\\uD800\\u0000"}', b'{"x":"\\uZZZZ"}']
+        self.assertEqual(self.node(program,[b.hex() for b in rejected]),[False,False,False])
+        receipt=self.receipt();receipt['engine_id']='\ud800';self.denied(encoded(receipt))
+    def test_D08_unknown_version(self):self.test_M04_no_v2()
+    def test_D09_wrong_digest(self):
+        self.denied(env_change=lambda e:e.update(RG06D_EXPECTED_SOURCE_IDENTITY_SHA256='9'*64))
+    def test_D10_missing_expectations(self):
+        for key in a.CHILD_EXPECTATIONS:
+            for value in (None,'','CONTROLLED_SECRET'):
+                def change(e):
+                    if value is None:e.pop(key,None)
+                    else:e[key]=value
+                self.denied(env_change=change)
+    def test_D11_directory_substitution(self):self.denied(bad_directory=True)
+    def test_D12_network_shape(self):
+        receipt=self.receipt();receipt['host_path']=[];self.denied(encoded(receipt))
+    def test_D13_hook_denies_before_insert(self):
+        for language in ('node','python'):
+            result,c=self.child(language,backend='bad');self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(c['insert_calls'],0)
+            self.assertGreater(c['connect_calls'],0);self.assertGreater(c['query_calls' if language=='node' else 'execute_calls'],0)
+            self.assertGreater(c['closed'],0)
+            if language=='node':self.assertEqual(c['callbacks'],1)
+    def test_D14_identity_before_handoff(self):
+        self.test_M01_node_valid_preload();self.test_M02_python_api_valid()
+
+    def test_canonical_vectors(self):
+        vectors=CANONICAL_VECTORS['valid_vectors']
+        for item in vectors:
+            raw=json.dumps(item['source'],sort_keys=True,separators=(',',':'),allow_nan=False).encode('ascii')
+            self.assertEqual(raw.hex(),item['canonical_hex']);self.assertEqual(hashlib.sha256(raw).hexdigest(),item['sha256'])
+            a.validate_source(item['source'],item['source'])
+        reference=self.node('const stable=v=>v===null?"null":typeof v==="string"?JSON.stringify(v):"{"+Object.keys(v).sort().map(k=>JSON.stringify(k)+":"+stable(v[k])).join(",")+"}";console.log(JSON.stringify(x.map(v=>Buffer.from(stable(v),"ascii").toString("hex"))))',[v['source'] for v in vectors])
+        self.assertEqual(reference,[v['canonical_hex'] for v in vectors])
+        production=self.node('console.log(JSON.stringify(x.map(s=>{try{return {hex:m.canonicalSource(s).toString("hex"),sha:m.sourceDigest(s)}}catch{return null}})))',[v['source'] for v in vectors])
+        for i,item in enumerate(vectors):
+            if i in (1,3):self.assertEqual(production[i],{'hex':item['canonical_hex'],'sha':item['sha256']})
+            else:self.assertIsNone(production[i])
+        saved=copy.deepcopy(self.source)
+        try:
+            for i,item in enumerate(vectors):
+                if i in (1,3):
+                    self.source=copy.deepcopy(item['source'])
+                    for language in ('node','python'):
+                        result,c=self.child(language);self.assertEqual(result.returncode,0,result.stderr)
+                        self.assertGreater(c['connect_calls'],0)
+                else:
+                    self.source=copy.deepcopy(saved);receipt=self.receipt();receipt['source_identity']=item['source'];self.denied(encoded(receipt))
+        finally:self.source=saved
+
+
+    def test_parent_expected_digest_before_child_spawn(self):
+        self.pg_run(host_observed=OBS, complete_pg=True)
+        self.assertEqual(self.last_child_env['RG06D_EXPECTED_SOURCE_IDENTITY_SHA256'],
+                         hashlib.sha256(a.canonical_source_bytes(self.source)).hexdigest())
+        self.assertEqual(self.last_child_env['GITHUB_SHA'],self.source['checkout_sha'])
+        self.assertEqual(self.last_child_env['RG06B_RUN_ID'],RUN)
+
+    def test_actual_symlink_receipt_denial(self):
+        for language in ('node','python'):
+            self.tearDown_fixture()
+            try:result,c=self.child(language,symlink_receipt=True)
+            except OSError as error:
+                if getattr(error,'winerror',None)==1314:self.skipTest('NOT_RUN: Windows symlink privilege unavailable')
+                raise
+            self.assertNotEqual(result.returncode,0)
+            self.assertEqual(c['pg_import_attempts' if language=='node' else 'psycopg_import_attempts'],0)
+            self.assertEqual(c['connect_calls'],0)
+
+    def test_network_stdout_strict_bound(self):
+        argv=['docker','--context','default','network','inspect','--format','projection','job']
+        class Process:
+            def __init__(self,raw,code=0):self.stdout=io.BytesIO(raw);self.code=code;self.killed=0
+            def poll(self):return self.code
+            def wait(self,timeout):return self.code
+            def kill(self):self.killed+=1
+        for raw,exception in [(b'x'*65537,ci.Stop),(b'\xff',UnicodeError)]:
+            process=Process(raw)
+            with patch.object(ci.subprocess,'Popen',return_value=process),self.assertRaises(exception):ci.output(argv)
+        process=Process(b'{"Id":"fixed","Name":"job"}')
+        with patch.object(ci.subprocess,'Popen',return_value=process):self.assertEqual(ci.output(argv),'{"Id":"fixed","Name":"job"}')
+        process=Process(b'',code=1)
+        with patch.object(ci.subprocess,'Popen',return_value=process),self.assertRaises(subprocess.CalledProcessError):ci.output(argv)
+        gate=ci.threading.Event()
+        class Blocked:
+            def read(self,count):gate.wait(1);return b''
+            def close(self):pass
+        process=Process(b'');process.stdout=Blocked();process.code=None
+        def kill():process.killed+=1;process.code=0;gate.set()
+        process.kill=kill
+        with patch.object(ci.subprocess,'Popen',return_value=process),patch.object(ci,'NETWORK_INSPECT_TIMEOUT',0.01),self.assertRaises(subprocess.TimeoutExpired):ci.output(argv)
+        self.assertEqual(process.killed,1)
+
+    def test_negative_canonical_vectors(self):
+        for item in CANONICAL_VECTORS['invalid_vectors']:
+            source=item['source'];name=item['id'];structurally_valid=name.startswith(('X02_','X03_','X10_'))
+            if structurally_valid:a.validate_source(source,source)
+            else:
+                with self.assertRaises(a.AdmissionError):a.validate_source(source,source)
+            with self.assertRaises(a.AdmissionError):a.validate_source_domain(source)
+            receipt=self.receipt();receipt['source_identity']=source;self.denied(encoded(receipt))
+        # X10's original partial-input vector is schema-valid D0, not D1. Also
+        # exercise its intended independent boundary on a full D1 object.
+        receipt=self.receipt();receipt['source_identity']['checkout_sha']='9'*40
+        a.validate_source_domain(receipt['source_identity']);self.denied(encoded(receipt))
 
 
 if __name__ == '__main__':

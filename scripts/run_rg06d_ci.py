@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import time
+import threading
 import tomllib
 import urllib.request
 import uuid
@@ -212,9 +213,45 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+NETWORK_INSPECT_TIMEOUT = 15
+
+
 def output(argv):
-    return subprocess.check_output(argv, cwd=ROOT, stderr=subprocess.DEVNULL,
-                                   text=True, timeout=15).strip()
+    if argv[:1] != ['docker'] or argv[3:5] != ['network', 'inspect']:
+        return subprocess.check_output(argv, cwd=ROOT, stderr=subprocess.DEVNULL,
+                                       text=True, timeout=15).strip()
+    # One argv-only inspection, capped before allocation; no stderr capture.
+    process = subprocess.Popen(argv, cwd=ROOT, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    ready = threading.Event()
+    result = {}
+    def read():
+        try:
+            result['raw'] = process.stdout.read(65537)
+        except Exception as error:
+            result['error'] = error
+        finally:
+            ready.set()
+    reader = threading.Thread(target=read, daemon=True)
+    started = time.monotonic()
+    reader.start()
+    try:
+        if not ready.wait(NETWORK_INSPECT_TIMEOUT):
+            raise subprocess.TimeoutExpired(argv, NETWORK_INSPECT_TIMEOUT)
+        if 'error' in result:
+            raise result['error']
+        require(len(result['raw']) <= 65536, 'COMMAND_OUTPUT_SIZE')
+        code = process.wait(timeout=max(0.01, NETWORK_INSPECT_TIMEOUT - (time.monotonic() - started)))
+        if code:
+            raise subprocess.CalledProcessError(code, argv)
+        return result['raw'].decode('utf-8').strip()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        reader.join(timeout=1)
+        if not reader.is_alive():
+            process.stdout.close()
 
 
 def source_git(*args):
@@ -270,6 +307,8 @@ def validate_launch(launch):
 def service_admission(path, source):
     require(os.environ.get('RG06D_RUNNER_ENV') == 'github-hosted', 'HOSTED_RUNNER_REQUIRED')
     require(not any(os.environ.get(k) for k in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH')), 'DOCKER_OVERRIDE')
+    reference = os.environ['RG06D_SERVICE_NETWORK']
+    admission.require(admission.classify_network_reference(reference) != 'REJECT', 'SERVICE_NETWORK')
     context = output(['docker', 'context', 'show'])
     endpoint = output(['docker', 'context', 'inspect', context, '--format', '{{.Endpoints.docker.Host}}'])
     require(endpoint == 'unix:///var/run/docker.sock', 'JOB_DOCKER_ENDPOINT')
@@ -278,13 +317,17 @@ def service_admission(path, source):
     require(bool(engine), 'ENGINE_ID')
     service_id = os.environ['RG06D_SERVICE_ID']
     require(re.fullmatch('[a-f0-9]{64}', service_id), 'SERVICE_ID')
+    network_raw = output(docker + ['network', 'inspect', '--format',
+        '{"Id":{{json .Id}},"Name":{{json .Name}}}', reference]).encode('utf-8')
+    admission.require(0 < len(network_raw) <= 65536, 'SERVICE_NETWORK')
+    network = admission.validate_network(admission.parse(network_raw), reference)
     fmt = ('{"Id":{{json .Id}},"Image":{{json .Image}},"State":{{json .State}},'
            '"Mounts":{{json .Mounts}},"NetworkSettings":{{json .NetworkSettings}}}')
     container = admission.parse(output(docker + ['inspect', service_id, '--format', fmt]).encode())
     image = admission.parse(output(docker + ['image', 'inspect', IMAGE, '--format',
         '{"Id":{{json .Id}},"Os":{{json .Os}},"Architecture":{{json .Architecture}},"RepoDigests":{{json .RepoDigests}}}']).encode())
     require(IMAGE.split('@')[1] in [s.split('@')[-1] for s in image['RepoDigests']], 'SERVICE_IMAGE_DIGEST')
-    admission.validate_service(container, image, service_id, os.environ['RG06D_SERVICE_NETWORK'], os.environ['RG06B_DB_PORT'])
+    admission.validate_service(container, image, service_id, network['Id'], os.environ['RG06B_DB_PORT'], network['Name'])
     address = next(iter(container['NetworkSettings']['Networks'].values()))['IPAddress']
     # Loopback TCP inside the admitted container binds the cluster to this service;
     # host-side connections independently validate the inspected bridge address.
@@ -295,14 +338,18 @@ def service_admission(path, source):
         '-d', 'reqguard_rg06b', '-h', '127.0.0.1', '-c', query]).encode())
     fingerprint = {k: observed[k] for k in admission.FINGERPRINT_KEYS}
     admission.validate_identity(observed, fingerprint, {'address': '127.0.0.1', 'port': 5432})
-    value = {'schema_version': 'rg06d-service-v2', 'run_id': path.name,
+    value = {'schema_version': 'rg06d-service-v3', 'run_id': path.name,
              'source_identity': source, 'container_id': service_id, 'engine_id': engine,
              'endpoint': endpoint, 'image': IMAGE, 'image_id': image['Id'],
-             'network_id': os.environ['RG06D_SERVICE_NETWORK'], 'host_port': os.environ['RG06B_DB_PORT'],
+             'network_reference': reference, 'network_name': network['Name'], 'network_id': network['Id'],
+             'attachment_network_name': next(iter(container['NetworkSettings']['Networks'])),
+             'attachment_network_id': next(iter(container['NetworkSettings']['Networks'].values()))['NetworkID'],
+             'host_port': os.environ['RG06B_DB_PORT'],
              'fingerprint': fingerprint, 'service_observation': observed,
              'host_path': {'address': address, 'port': 5432},
              'host_target': {'host': '127.0.0.1', 'port': int(os.environ['RG06B_DB_PORT'])},
              'published_bindings': container['NetworkSettings']['Ports']['5432/tcp']}
+    admission.validate_service_receipt(value, path.name, source, os.environ)
     write(path / 'service-identity.json', value)
     return value
 
@@ -342,20 +389,7 @@ def validate_admission_bundle(directory, source, run):
     admission.validate_unit(admission.parse(raw['ownership-unit.json']), run, source)
     admission.validate_preload(admission.parse(raw['pg-preload.json']), run, source)
     service = admission.parse(raw['service-identity.json'])
-    admission.shape(service, ('schema_version', 'run_id', 'source_identity', 'container_id', 'engine_id',
-                             'endpoint', 'image', 'image_id', 'network_id', 'host_port', 'fingerprint',
-                             'service_observation', 'host_path', 'host_target', 'published_bindings'))
-    require(service['schema_version'] == 'rg06d-service-v2' and service['run_id'] == run
-            and service['image'] == IMAGE and service['endpoint'] == 'unix:///var/run/docker.sock', 'SERVICE_RECEIPT')
-    admission.validate_source(service['source_identity'], source)
-    require(service['container_id'] == os.environ['RG06D_SERVICE_ID']
-            and service['network_id'] == os.environ['RG06D_SERVICE_NETWORK']
-            and service['host_port'] == os.environ['RG06B_DB_PORT']
-            and bool(service['engine_id']) and re.fullmatch('sha256:[a-f0-9]{64}', service['image_id']), 'SERVICE_CONTEXT')
-    admission.validate_bindings(service['published_bindings'], service['host_port'])
-    admission.validate_client_target('127.0.0.1', int(service['host_port']), service['host_target'])
-    admission.validate_identity(service['service_observation'], service['fingerprint'], {'address': '127.0.0.1', 'port': 5432})
-    require(not ipaddress.ip_address(service['host_path']['address']).is_loopback, 'SERVICE_HOST_PATH')
+    admission.validate_service_receipt(service, run, source, os.environ)
     admission.validate_connections(admission.parse(raw['connections.json']), run, source, service['fingerprint'], service['host_path'])
     return raw
 
@@ -581,6 +615,8 @@ def run_tests():
         env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
         env.update(DATABASE_URL=dsn, RG06B_PASSWORD=PASSWORD, RG06B_API_PORT=str(api_port),
                    RG06B_BASE_URL=f'http://127.0.0.1:{api_port}', PYTHONDONTWRITEBYTECODE='1')
+        admission.validate_source_domain(source)
+        env['RG06D_EXPECTED_SOURCE_IDENTITY_SHA256'] = admission.diagnostic_binding(path.name, source)[1]['source_identity_sha256']
         # These child-only values fulfill the existing RG-06B config/spec contract.
         for name in ('uvicorn.stdout', 'uvicorn.stderr', 'playwright.stdout', 'playwright.stderr'):
             streams.append((path / name).open('xb'))
