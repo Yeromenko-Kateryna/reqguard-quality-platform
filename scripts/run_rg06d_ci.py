@@ -23,6 +23,7 @@ import time
 import tomllib
 import urllib.request
 import uuid
+from types import MappingProxyType
 import rg06d_admission as admission
 
 
@@ -426,6 +427,11 @@ class RuntimeFailure:
         self.source = None
         self.index = 0
         self.first = None
+        self._source_bytes = None
+        self._first_bytes = None
+        self._persisted = False
+        self._initial_attempted = False
+        self._cleanup = 'PENDING'
 
     def completed(self, stage):
         require(self.first is None and admission.DIAGNOSTIC_STAGES[self.index] == stage,
@@ -434,36 +440,56 @@ class RuntimeFailure:
 
     def save(self):
         try:
-            identity, reference = admission.diagnostic_binding(self.path.name, self.source)
-            value = {**self.first, 'schema_version': 'rg06d-failure-diagnostic-v1',
-                     'run_identity': identity, 'source_identity_reference': reference}
+            source = json.loads(self._source_bytes)
+            value = json.loads(self._first_bytes)
+            value['cleanup_status'] = self._cleanup
             raw = (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode('ascii')
-            admission.atomic_failure(self.path, raw, self.path.name, self.source)
+            if not self._persisted:
+                admission.require(not self._initial_attempted, 'DIAGNOSTIC_INITIAL_UNAVAILABLE')
+                self._initial_attempted = True
+                identity = admission.begin_capture(self.path)
+                admission.atomic_failure(self.path, raw, self.path.name, source)
+                admission.confirm_capture(self.path, identity, raw, self.path.name, source)
+                self._persisted = True
+            else:
+                admission.require(not admission.capture_denied(self.path), 'DIAGNOSTIC_CAPTURE_DENIED')
+                admission.atomic_failure(self.path, raw, self.path.name, source)
         except Exception:
             print('DIAGNOSTIC_UNAVAILABLE')
 
     def failed(self, error):
         if self.first is not None:
             return
-        stage = admission.DIAGNOSTIC_STAGES[self.index]
-        code = 'EXECUTION_EXCEPTION'
-        if isinstance(error, Stop) and str(error) in admission.DIAGNOSTIC_CODES[stage]:
-            code = str(error)
-        elif isinstance(error, admission.AdmissionError):
-            code = 'ADMISSION_REJECTED'
-        self.first = {'last_completed_runtime_stage': admission.DIAGNOSTIC_STAGES[self.index - 1]
-                      if self.index else 'NONE', 'first_failed_runtime_stage': stage,
-                      'allowlisted_failure_code': code, 'cleanup_status': 'PENDING'}
-        self.save()
+        # Latch before classification/I/O. Capture failure cannot be recaptured later.
+        self.first = MappingProxyType({})
+        try:
+            stage = admission.DIAGNOSTIC_STAGES[self.index]
+            source = json.loads(json.dumps(self.source, allow_nan=False))
+            identity, reference = admission.diagnostic_binding(self.path.name, source)
+            code, original, site = admission.attribute_first_error(
+                error, stage, source, FIRST_ERROR_RUNNER_CODES, Stop)
+            value = {'last_completed_runtime_stage': admission.DIAGNOSTIC_STAGES[self.index - 1]
+                     if self.index else 'NONE', 'first_failed_runtime_stage': stage,
+                     'allowlisted_failure_code': code, 'cleanup_status': 'PENDING',
+                     'schema_version': 'rg06d-failure-diagnostic-v2',
+                     'run_identity': identity, 'source_identity_reference': reference,
+                     'first_admission_error_code': original, 'first_admission_call_site': site}
+            self._source_bytes = json.dumps(source, sort_keys=True, allow_nan=False).encode('ascii')
+            self._first_bytes = json.dumps(value, sort_keys=True, allow_nan=False).encode('ascii')
+            self.first = MappingProxyType({k: v for k, v in value.items()
+                                           if k not in ('run_identity', 'source_identity_reference')})
+            self.save()
+        except Exception:
+            print('DIAGNOSTIC_UNAVAILABLE')
 
     def cleanup(self, server_receipt, test_receipt, summary, raised):
-        if self.first is None:
+        if self.first is None or not self._persisted or self._cleanup != 'PENDING':
             return
         complete = (not raised and summary.get('descendantsExited') is True
                     and all(not r['started'] or (r['exited'] and not r['forced']
                             and not r.get('terminationUnknown')) for r in (server_receipt, test_receipt))
                     and (not server_receipt['started'] or server_receipt.get('gracefulShutdown') is True))
-        self.first['cleanup_status'] = 'COMPLETED' if complete else 'FAILED_OR_UNVERIFIED'
+        self._cleanup = 'COMPLETED' if complete else 'FAILED_OR_UNVERIFIED'
         self.save()
 
 
@@ -618,7 +644,9 @@ def run_tests():
         failure.completed('EVIDENCE_VALIDATION')
     except BaseException as error:
         failure.failed(error)
-        summary['reason'] = str(error) if isinstance(error, Stop) else 'EXECUTION_' + type(error).__name__
+        # Only bounded classification, never dynamic exception text/class names.
+        summary['reason'] = (failure.first.get('allowlisted_failure_code', 'EXECUTION_EXCEPTION')
+                             if failure.first is not None else 'EXECUTION_EXCEPTION')
     finally:
         with diagnostic_cleanup(failure, server_receipt, test_receipt, summary):
             for process, receipt in [(playwright, test_receipt), (server, server_receipt)]:
@@ -657,11 +685,18 @@ def publish_failure(raw, safe, publication):
     target = safe / admission.DIAGNOSTIC_NAME
     try:
         require(publication['runOutcome'] == 'failure', 'DIAGNOSTIC_CONTEXT')
+        require(raw.name == os.environ['RG06B_RUN_ID'], 'DIAGNOSTIC_EXECUTION_CONTEXT')
+        require(not admission.capture_denied(raw), 'DIAGNOSTIC_CAPTURE_DENIED')
+        directory_identity = admission.capture_directory(raw)
         source = source_identity()
+        require(source['github_run_id'] == os.environ['GITHUB_RUN_ID']
+                and source['github_run_attempt'] == os.environ['GITHUB_RUN_ATTEMPT'], 'DIAGNOSTIC_CI_CONTEXT')
         original = admission.read_failure(raw, raw.name, source)
         admission.atomic_failure(safe, original, raw.name, source)
         require(admission.read_failure(safe, raw.name, source) == original, 'DIAGNOSTIC_COPY_CHANGED')
         require(admission.read_failure(raw, raw.name, source) == original, 'DIAGNOSTIC_RAW_CHANGED')
+        require(admission.capture_directory(raw) == directory_identity
+                and not admission.capture_denied(raw), 'DIAGNOSTIC_CAPTURE_CHANGED')
         publication['diagnosticPublication'] = 'PUBLISHED'
     except Exception:
         # safe is newly created; remove only this diagnostic copy, never raw files.
@@ -748,6 +783,11 @@ def publish():
     write(safe / 'publication-manifest.json', publication)
     require(publication['copied'] and not publication['rejected'], 'EVIDENCE_PUBLICATION_INCOMPLETE')
     print('RG06D safe evidence prepared')
+
+
+
+
+FIRST_ERROR_RUNNER_CODES = tuple(('C', f.__code__) for f in (require, service_admission, run_tests))
 
 
 if __name__ == '__main__':

@@ -1,5 +1,9 @@
 """Synthetic deterministic admission tests. Never connect to Docker, PostgreSQL or GitHub."""
 import copy
+import ast
+from contextlib import ExitStack, contextmanager
+import sys
+import zipfile
 import hashlib
 import json
 import io
@@ -1028,6 +1032,481 @@ class FailureDiagnosticTests(unittest.TestCase):
                                         env={**os.environ, 'RUN_OUTCOME': runtime, 'PUBLISH_OUTCOME': publish,
                                              'UPLOAD_OUTCOME': 'success', 'ARTIFACT_ID': '123'}, capture_output=True)
                 self.assertEqual(result.returncode, expected, result.stderr.decode(errors='replace'))
+
+
+
+
+class FirstErrorV2Tests(unittest.TestCase):
+    """T01-T22: local deterministic fixtures; no hosted artifact or runtime admission."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='rg06d-first-v2-')
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.raw = self.directory / RUN
+        self.raw.mkdir()
+        self.source = copy.deepcopy(SOURCE)
+        for name in ('rg06d_admission.py', 'run_rg06d_ci.py'):
+            self.source['inputs']['scripts/' + name] = hashlib.sha256(
+                Path(a.__file__).with_name(name).read_bytes()).hexdigest()
+
+    def tracker(self, error=None):
+        tracker = ci.RuntimeFailure(self.raw)
+        tracker.source = copy.deepcopy(self.source)
+        for stage in a.DIAGNOSTIC_STAGES[:5]: tracker.completed(stage)
+        if error is not None: tracker.failed(error)
+        return tracker
+
+    def value(self):
+        return a.validate_failure(a.read_failure(self.raw, RUN, self.source), RUN, self.source)
+
+    def caught(self, operation):
+        try: operation()
+        except BaseException as error: return error
+        self.fail('Expected fixture to raise')
+
+    def classify(self, operation):
+        return a.attribute_first_error(self.caught(operation), 'POSTGRESQL_ADMISSION',
+                                       self.source, ci.FIRST_ERROR_RUNNER_CODES, ci.Stop)
+
+    def local_publish(self, source=None):
+        with patch.dict('os.environ', {**ENV, 'RUNNER_TEMP': str(self.directory),
+                                      'RG06D_RUN_OUTCOME': 'failure'}), \
+             patch.object(ci, 'artifact', return_value=self.raw), \
+             patch.object(ci, 'source_identity', return_value=source or self.source):
+            with self.assertRaises(ci.Stop): ci.publish()
+        return self.directory / 'rg06d-safe-123-1'
+
+    def pg_run(self, change=None, container_raw=None, image_raw=None, psql_raw=None,
+               command_error=None, host_observed=None, driver_error=None, query_error=None,
+               environment_updates=None):
+        # Real run_tests/service_admission/predicates/capture; prior gates and all
+        # external operations are deterministic doubles, never acceptance evidence.
+        container = {'Id': 'e' * 64, 'Image': 'image',
+                     'State': {'Running': True, 'Health': {'Status': 'healthy'}},
+                     'Mounts': [{'Type': 'volume', 'Destination': '/var/lib/postgresql/data'}],
+                     'NetworkSettings': {'Networks': {'job': {'NetworkID': 'f' * 64, 'IPAddress': '172.18.0.2'}},
+                                         'Ports': {'5432/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '49123'}]}}}
+        if change: change(container)
+        image = {'Id': 'image', 'Os': 'linux', 'Architecture': 'amd64', 'RepoDigests': [ci.IMAGE]}
+        observed = {**FP, 'address': '127.0.0.1', 'port': 5432, 'backend_pid': 99}
+        root = self.directory / 'runtime'; root.mkdir()
+        package = root / 'quality/browser'; package.mkdir(parents=True)
+        packages = {n: '1' for n in ('fastapi', 'psycopg', 'psycopg-binary', 'uvicorn', 'pydantic', 'starlette')}
+        (root / 'uv.lock').write_text('\n'.join('[[' + 'package]]\nname="' + n + '"\nversion="1"' for n in packages))
+        for n in ('@playwright/test', 'playwright', 'playwright-core', 'pg'):
+            target = package / 'node_modules' / n; target.mkdir(parents=True)
+            (target / 'package.json').write_text(json.dumps({'version': '8.23.1' if n == 'pg' else '1.64.0'}))
+        (package / 'node_modules/playwright-core/browsers.json').write_text(
+            '{"browsers":[{"name":"chromium","revision":"1248"}]}')
+        browser = root / 'cache/chromium-1248/chrome'; browser.parent.mkdir(parents=True); browser.write_bytes(b'fixture')
+        a.write(self.raw, 'launch.json', {'inputs': {}})
+        def output(argv):
+            if argv[0] in ('node', 'npm', 'uv'):
+                if '--input-type=module' in argv: return str(browser)
+                return {'node': 'v24.15.0', 'npm': '11.12.1', 'uv': '0.11.22'}[argv[0]]
+            if command_error: raise command_error
+            if argv[1:3] == ['context', 'show']: return 'default'
+            if argv[1:3] == ['context', 'inspect']: return 'unix:///var/run/docker.sock'
+            if 'info' in argv: return 'fixture-engine'
+            if 'exec' in argv: return json.dumps(observed) if psql_raw is None else psql_raw
+            if 'image' in argv: return json.dumps(image) if image_raw is None else image_raw
+            return json.dumps(container) if container_raw is None else container_raw
+        @contextmanager
+        def connect(*args, **kwargs):
+            if driver_error is not None: raise driver_error
+            if host_observed is None: raise RuntimeError('fixture stops before SQL')
+            connection = FakeConnection(observed=host_observed)
+            connection.query_error = query_error
+            yield connection
+        environment = {**ENV, 'RG06D_RUNNER_ENV': 'github-hosted', 'GITHUB_ACTIONS': 'true',
+                       'RG06D_DB_PASSWORD': ci.PASSWORD, 'PLAYWRIGHT_BROWSERS_PATH': str(root / 'cache')}
+        with ExitStack() as stack:
+            for key in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH'):
+                environment[key] = ''
+            environment.update(environment_updates or {})
+            stack.enter_context(patch.dict('os.environ', environment))
+            for obj, name, value in ((ci, 'ROOT', root), (ci, 'PACKAGE', package),
+                 (ci, 'artifact', lambda: self.raw), (ci, 'source_identity', lambda: self.source),
+                 (ci, 'validate_launch', lambda _: self.source), (ci, 'unit_gate', lambda *args: None),
+                 (ci, 'preload_gate', lambda *args: None), (ci, 'output', output),
+                 (ci.sys, 'platform', 'linux'), (ci.sys, 'version_info', (3, 12, 10)),
+                 (ci.ctypes, 'CDLL', lambda *args, **kwargs: SimpleNamespace(prctl=MagicMock(return_value=0))),
+                 (ci.importlib.metadata, 'version', lambda n: packages[n]),
+                 (ci, 'no_descendants', lambda s: s.update(descendantsExited=True))):
+                stack.enter_context(patch.object(obj, name, value))
+            stack.enter_context(patch.dict(sys.modules, {'psycopg': SimpleNamespace(connect=connect)}))
+            self.assertEqual(ci.run_tests(), 1)
+        value = self.value()
+        evidence = os.environ.get('RG06D_LOCAL_EVIDENCE')
+        if evidence:
+            folder = Path(evidence)
+            name = 'capture-' + str(len(list(folder.glob('capture-*.json')))).zfill(3) + '.json'
+            with (folder / name).open('xb') as stream:
+                stream.write(a.read_failure(self.raw, RUN, self.source))
+        return value
+
+    def test_T01_repeated_first_and_mutable_source(self):
+        t = self.tracker(RuntimeError('first marker'))
+        before = a.read_failure(self.raw, RUN, self.source)
+        t.source['checkout_sha'] = 'f' * 40
+        t.failed(a.AdmissionError('SERVICE_NETWORK'))
+        t.cleanup({'started': False}, {'started': False}, {'descendantsExited': True}, False)
+        after = self.value(); initial = a.validate_failure(before, RUN, self.source)
+        self.assertEqual({k: v for k, v in after.items() if k != 'cleanup_status'},
+                         {k: v for k, v in initial.items() if k != 'cleanup_status'})
+        with self.assertRaises(TypeError): t.first['first_admission_call_site'] = 'FORGED'
+
+    def test_T02_cleanup_error_never_replaces_primary(self):
+        t = self.tracker(RuntimeError('primary'))
+        with self.assertRaises(RuntimeError):
+            with ci.diagnostic_cleanup(t, {'started': False}, {'started': False}, {}):
+                raise RuntimeError('cleanup')
+        self.assertEqual(self.value()['cleanup_status'], 'FAILED_OR_UNVERIFIED')
+        self.assertEqual(self.value()['first_admission_error_code'], 'EXECUTION_EXCEPTION')
+
+    def test_T03_distinct_network_predicates_actual_run(self):
+        for count, expected in ((False, 'A.SVC.NETWORK_ID_SET'), (True, 'A.SVC.NETWORK_COUNT')):
+            with self.subTest(count=count):
+                if count:
+                    self.tearDown_fixture()
+                def change(c):
+                    nets = c['NetworkSettings']['Networks']
+                    if count: nets['second'] = dict(nets['job'])
+                    else: nets['job']['NetworkID'] = '9' * 64
+                value = self.pg_run(change=change)
+                self.assertEqual(value['first_admission_error_code'], 'SERVICE_NETWORK')
+                self.assertEqual(value['first_admission_call_site'], expected)
+        for bindings, port in (([], 'bad'), ([{'HostIp': '0.0.0.0', 'HostPort': '9999'}], '49123')):
+            self.assertEqual(self.classify(lambda: a.validate_bindings(bindings, port))[1:],
+                             ('SERVICE_PORT', 'UNRESOLVED'))
+        for ip, expected in ((123, 'A.BIND.IP_TYPE'), ('192.0.2.1', 'A.BIND.IP_SET')):
+            self.tearDown_fixture()
+            value = self.pg_run(change=lambda c: c['NetworkSettings']['Ports']['5432/tcp'][0].update(HostIp=ip))
+            self.assertEqual(value['first_admission_call_site'], expected)
+        self.tearDown_fixture()
+        value = self.pg_run(change=lambda c: c['NetworkSettings']['Ports']['5432/tcp'][0].update(HostPort='9999'))
+        self.assertEqual(value['first_admission_call_site'], 'A.BIND.PORT_MATCH')
+        for env, expected in (({'RG06B_DB_PORT': 'bad'}, 'R.PG.PORT'),
+                              ({'RG06D_DB_PASSWORD': 'wrong'}, 'R.PG.CREDENTIAL'),
+                              ({'RG06D_RUNNER_ENV': 'self-hosted'}, 'R.SVC.HOSTED'),
+                              ({'DOCKER_HOST': 'override'}, 'R.SVC.NO_OVERRIDE')):
+            self.tearDown_fixture()
+            value = self.pg_run(environment_updates=env)
+            self.assertEqual(value['first_admission_call_site'], expected)
+
+    def tearDown_fixture(self):
+        # Delete only this test's newly created TemporaryDirectory, never source/evidence.
+        self.temp.cleanup(); self.setUp()
+
+    def test_T04_nested_shapes_parser_and_invocation_roles(self):
+        value = self.pg_run(change=lambda c: c['NetworkSettings']['Ports']['5432/tcp'][0].pop('HostIp'))
+        self.assertEqual(value['first_admission_call_site'], 'A.BIND.ITEM_FIELDS')
+        for role in ('CONTAINER', 'IMAGE', 'PSQL'):
+            for raw, suffix in (('{"duplicate":0,"duplicate":1}', 'DUPLICATE'),
+                                ('', 'SIZE'), ('{"value":NaN}', 'NONFINITE'), ('{', 'JSON')):
+                self.tearDown_fixture()
+                value = self.pg_run(**{role.lower() + '_raw': raw})
+                self.assertEqual(value['first_admission_call_site'], 'P.' + role + '.' + suffix)
+        for host in (False, True):
+            self.tearDown_fixture()
+            if host: value = self.pg_run(host_observed={**OBS, 'backend_pid': 0})
+            else: value = self.pg_run(psql_raw=json.dumps({**FP, 'address': '127.0.0.1', 'port': 5432, 'backend_pid': 0}))
+            self.assertEqual(value['first_admission_call_site'], 'A.' + ('HOSTID' if host else 'SVCID') + '.PID')
+
+    def test_T05_docker_errors_unresolved(self):
+        for error in (OSError('marker'), subprocess.CalledProcessError(1, ['docker'], output='marker'),
+                      subprocess.TimeoutExpired(['docker'], 1, output='marker'), UnicodeError('marker')):
+            self.tearDown_fixture(); value = self.pg_run(command_error=error)
+            self.assertEqual((value['first_admission_error_code'], value['first_admission_call_site']),
+                             ('EXECUTION_EXCEPTION', 'UNRESOLVED'))
+
+    def test_T06_unexpected_argument_and_driver_errors(self):
+        value = self.pg_run(change=lambda c: c.pop('Id'))
+        self.assertEqual(value['first_admission_call_site'], 'UNRESOLVED')
+        self.assertEqual(value['first_admission_error_code'], 'EXECUTION_EXCEPTION')
+        self.assertEqual(self.classify(lambda: a.validate_identity({**OBS}, FP, {'address': 'bad', 'port': 5432})),
+                         ('EXECUTION_EXCEPTION', 'EXECUTION_EXCEPTION', 'UNRESOLVED'))
+        self.tearDown_fixture(); value = self.pg_run()
+        self.assertEqual(value['first_admission_error_code'], 'EXECUTION_EXCEPTION')
+
+    def test_T07_unknown_and_incompatible_pairs(self):
+        t = self.tracker(a.AdmissionError('UNKNOWN_MARKER')); value = self.value()
+        self.assertEqual((value['first_admission_error_code'], value['first_admission_call_site']), ('UNRESOLVED', 'UNRESOLVED'))
+        for code, site in [('UNRESOLVED', 'A.SVC.ID'), ('SERVICE_PORT', 'A.SVC.ID'),
+                           ('SERVICE_ID', 'R.SVC.ID'), ('SERVICE_NETWORK', 'UNKNOWN'), ('NOT_APPLICABLE', 'NOT_APPLICABLE')]:
+            bad = {**value, 'first_admission_error_code': code, 'first_admission_call_site': site}
+            with self.subTest(code=code, site=site), self.assertRaises(a.AdmissionError):
+                a.validate_failure(encoded(bad), RUN, self.source)
+
+    def test_T08_registry_source_and_code_drift(self):
+        a.registry_model(self.source, ci.FIRST_ERROR_RUNNER_CODES)
+        bad = copy.deepcopy(self.source); bad['inputs']['scripts/rg06d_admission.py'] = '0' * 64
+        with self.assertRaises(a.AdmissionError): a.registry_model(bad, ci.FIRST_ERROR_RUNNER_CODES)
+        hashes = dict(a.FIRST_ERROR_FUNCTION_HASHES); hashes['A', 'validate_service'] = '0' * 64
+        with patch.object(a, 'FIRST_ERROR_FUNCTION_HASHES', hashes), self.assertRaises(a.AdmissionError):
+            a.registry_model(self.source, ci.FIRST_ERROR_RUNNER_CODES)
+        fake = compile('def require(ok, code):\n raise RuntimeError()\n', 'fake', 'exec').co_consts[0]
+        with self.assertRaises(a.AdmissionError): a.registry_model(self.source, (('C', fake),))
+        self.assertEqual(len(a.FIRST_ERROR_REGISTRY), 62)
+        self.assertEqual(len({e[0] for e in a.FIRST_ERROR_REGISTRY}), 62)
+        original = Path(a.__file__).read_bytes()
+        padded = ast.parse(b'\n\n' + original)
+        self.assertEqual(a.ast_fingerprint(a.function_nodes(padded)['validate_service']),
+                         a.FIRST_ERROR_FUNCTION_HASHES['A', 'validate_service'])
+        changed = original.replace(b'1 <= len(mappings) <= 2', b'1 <= len(mappings) <= 3')
+        model = self.directory / 'changed'; model.mkdir()
+        (model / 'rg06d_admission.py').write_bytes(changed)
+        (model / 'run_rg06d_ci.py').write_bytes(Path(a.__file__).with_name('run_rg06d_ci.py').read_bytes())
+        changed_source = copy.deepcopy(self.source)
+        changed_source['inputs']['scripts/rg06d_admission.py'] = hashlib.sha256(changed).hexdigest()
+        with patch.object(a, '__file__', str(model / 'rg06d_admission.py')), self.assertRaises(a.AdmissionError):
+            a.registry_model(changed_source, ci.FIRST_ERROR_RUNNER_CODES)
+
+    def test_T09_missing_positions_and_ambiguous_registry(self):
+        with patch.object(a, 'traceback_operation', return_value=None):
+            self.assertEqual(self.classify(lambda: a.validate_bindings([], 'bad')),
+                             ('ADMISSION_REJECTED', 'UNRESOLVED', 'UNRESOLVED'))
+        with patch.object(a, 'FIRST_ERROR_REGISTRY', a.FIRST_ERROR_REGISTRY + (a.FIRST_ERROR_REGISTRY[0],)):
+            with self.assertRaises(a.AdmissionError): a.registry_model(self.source, ci.FIRST_ERROR_RUNNER_CODES)
+        entry = next(e for e in a.FIRST_ERROR_REGISTRY if e[0] == 'A.SVC.NETWORK_ID_SET')
+        with patch.object(a, 'FIRST_ERROR_REGISTRY', a.FIRST_ERROR_REGISTRY + (('A.DUPLICATE', *entry[1:]),)):
+            value = self.pg_run(change=lambda c: c['NetworkSettings']['Networks']['job'].update(NetworkID='9' * 64))
+        self.assertEqual(value['first_admission_call_site'], 'UNRESOLVED')
+        def deep(count):
+            if count: return deep(count - 1)
+            a.validate_bindings([], 'bad')
+        self.assertEqual(self.classify(lambda: deep(70)), ('ADMISSION_REJECTED', 'UNRESOLVED', 'UNRESOLVED'))
+
+    def test_T10_sensitive_messages_and_causes_not_serialized(self):
+        class Hostile(a.AdmissionError):
+            def __str__(self): raise AssertionError('str must not run')
+            def __repr__(self): raise AssertionError('repr must not run')
+        error = Hostile('CONTROLLED_SECRET_MESSAGE'); error.__cause__ = RuntimeError('CONTROLLED_CAUSE')
+        self.tracker(error)
+        raw = a.read_failure(self.raw, RUN, self.source)
+        self.assertNotIn(b'CONTROLLED', raw); self.assertNotIn(b'Hostile', raw)
+
+    def test_T11_independent_identity_mismatch(self):
+        self.tracker(RuntimeError('fixture')); value = self.value()
+        for field, key, replacement in [('run_identity', 'execution_id', '9' * 32),
+                ('run_identity', 'github_run_id', '999'), ('run_identity', 'github_run_attempt', '2'),
+                ('source_identity_reference', 'checkout_sha', '9' * 40),
+                ('source_identity_reference', 'source_identity_sha256', '9' * 64)]:
+            bad = copy.deepcopy(value); bad[field][key] = replacement
+            with self.subTest(key=key), self.assertRaises(a.AdmissionError): a.validate_failure(encoded(bad), RUN, self.source)
+
+    def test_T12_strict_json_finite_states_and_size(self):
+        self.tracker(RuntimeError('fixture')); value = self.value()
+        for code, site in [('EXECUTION_EXCEPTION', 'A.SVC.ID'), ('UNRESOLVED', 'UNRESOLVED'), ('EXECUTION_EXCEPTION', True)]:
+            bad = {**value, 'first_admission_error_code': code, 'first_admission_call_site': site}
+            with self.assertRaises(a.AdmissionError): a.validate_failure(encoded(bad), RUN, self.source)
+        raw = encoded(value)
+        a.validate_failure(raw + b' ' * (2048 - len(raw)), RUN, self.source)
+        for raw in (raw + b' ' * (2049 - len(raw)), b'{"x":0,"x":1}', b'{"x":NaN}',
+                    encoded({**value, 'extra': 'secret'}), encoded({**value, 'schema_version': True})):
+            with self.assertRaises(a.AdmissionError): a.validate_failure(raw, RUN, self.source)
+        for identifier, code, _ in a.FIRST_ERROR_REGISTRY:
+            broad = code if identifier.startswith('R.') else 'ADMISSION_REJECTED'
+            good = {**value, 'allowlisted_failure_code': broad,
+                    'first_admission_error_code': code, 'first_admission_call_site': identifier}
+            a.validate_failure(encoded(good), RUN, self.source)
+            a.validate_failure(encoded({**good, 'first_admission_call_site': 'UNRESOLVED'}), RUN, self.source)
+        for index, stage in enumerate(a.DIAGNOSTIC_STAGES):
+            if stage == 'POSTGRESQL_ADMISSION': continue
+            other = {**value, 'first_failed_runtime_stage': stage,
+                     'last_completed_runtime_stage': a.DIAGNOSTIC_STAGES[index - 1] if index else 'NONE',
+                     'first_admission_error_code': 'NOT_APPLICABLE', 'first_admission_call_site': 'NOT_APPLICABLE'}
+            a.validate_failure(encoded(other), RUN, self.source)
+            with self.assertRaises(a.AdmissionError):
+                a.validate_failure(encoded({**other, 'first_admission_call_site': 'UNRESOLVED'}), RUN, self.source)
+
+    def test_T13_initial_and_update_atomic_faults(self):
+        replace = a.os.replace
+        def after_replace(*args): replace(*args); raise OSError('uncertain replace')
+        for fault in (OSError('before replace'), after_replace):
+            self.tearDown_fixture()
+            with patch.object(a.os, 'replace', side_effect=fault): t = self.tracker(RuntimeError('first'))
+            self.assertTrue(a.capture_denied(self.raw)); self.assertFalse(t._persisted)
+            t.cleanup({'started': False}, {'started': False}, {'descendantsExited': True}, False)
+            safe = self.local_publish()
+            self.assertFalse((safe / a.DIAGNOSTIC_NAME).exists())
+        self.tearDown_fixture(); t = self.tracker(RuntimeError('first')); before = a.read_failure(self.raw, RUN, self.source)
+        with patch.object(a.os, 'replace', side_effect=OSError('update')):
+            t.cleanup({'started': False}, {'started': False}, {'descendantsExited': True}, False)
+        self.assertEqual(a.read_failure(self.raw, RUN, self.source), before)
+        self.assertEqual(self.value()['cleanup_status'], 'PENDING')
+        for boundary in ('tempfile', 'write', 'flush', 'fsync', 'validation', 'foreign-marker'):
+            self.tearDown_fixture()
+            with ExitStack() as stack:
+                if boundary == 'tempfile': stack.enter_context(patch.object(a.tempfile, 'mkstemp', side_effect=OSError('tempfile')))
+                if boundary == 'fsync': stack.enter_context(patch.object(a.os, 'fsync', side_effect=OSError('fsync')))
+                if boundary in ('write', 'flush'):
+                    original_open = a.os.fdopen
+                    class FaultStream:
+                        def __init__(self, *args): self.stream = original_open(*args)
+                        def __enter__(self): self.stream.__enter__(); return self
+                        def __exit__(self, *args): return self.stream.__exit__(*args)
+                        def fileno(self): return self.stream.fileno()
+                        def write(self, raw):
+                            if boundary == 'write': raise OSError('write')
+                            return self.stream.write(raw)
+                        def flush(self):
+                            if boundary == 'flush': raise OSError('flush')
+                            return self.stream.flush()
+                    stack.enter_context(patch.object(a.os, 'fdopen', FaultStream))
+                if boundary == 'validation':
+                    original_validate = a.validate_failure; calls = []
+                    def validate(*args):
+                        calls.append(None)
+                        if len(calls) == 2: raise a.AdmissionError('DIAGNOSTIC_CAPTURE_CHANGED')
+                        return original_validate(*args)
+                    stack.enter_context(patch.object(a, 'validate_failure', side_effect=validate))
+                if boundary == 'foreign-marker':
+                    confirm = a.confirm_capture
+                    def foreign(directory, *args):
+                        marker = directory / a.DIAGNOSTIC_DENIAL
+                        marker.rename(directory / 'original-marker')
+                        marker.write_bytes(b'CAPTURE_NOT_CONFIRMED\n')
+                        return confirm(directory, *args)
+                    stack.enter_context(patch.object(a, 'confirm_capture', side_effect=foreign))
+                t = self.tracker(RuntimeError('first'))
+                self.assertFalse(t._persisted, boundary)
+            self.assertTrue(a.capture_denied(self.raw), boundary)
+            safe = self.local_publish()
+            self.assertFalse((safe / a.DIAGNOSTIC_NAME).exists(), boundary)
+
+    def test_T14_safe_copy_mutation_denied(self):
+        self.tracker(RuntimeError('first')); real = a.atomic_failure
+        def mutate(directory, raw, run, source):
+            real(directory, raw, run, source)
+            if directory != self.raw: (self.raw / a.DIAGNOSTIC_NAME).write_bytes(b'{')
+        with patch.object(a, 'atomic_failure', side_effect=mutate): safe = self.local_publish()
+        self.assertFalse((safe / a.DIAGNOSTIC_NAME).exists())
+
+    def test_T15_diagnostic_cannot_turn_runtime_green(self):
+        self.tracker(RuntimeError('first')); safe = self.local_publish()
+        manifest = a.parse((safe / 'publication-manifest.json').read_bytes())
+        self.assertEqual(manifest['diagnosticPublication'], 'PUBLISHED')
+        self.assertEqual(manifest['runOutcome'], 'failure'); self.assertEqual(manifest['copied'], [])
+        self.assertTrue(manifest['rejected'])
+
+    def test_T16_existing_gates_still_mandatory(self):
+        self.tracker(RuntimeError('first')); bundle(self.raw)
+        for name in ('ownership-unit.json', 'pg-preload.json', 'ownership-preservation.json', 'ownership.json'):
+            data = (self.raw / name).read_bytes(); (self.raw / name).unlink()
+            with patch.dict('os.environ', ENV), self.assertRaises((a.AdmissionError, OSError, ci.Stop)):
+                ci.validate_admission_bundle(self.raw, SOURCE, RUN)
+            (self.raw / name).write_bytes(data)
+
+    def test_T17_separate_strict_historical_v1(self):
+        self.tracker(RuntimeError('fixture')); value = self.value()
+        old = {k: v for k, v in value.items() if not k.startswith('first_admission_')}
+        old['schema_version'] = 'rg06d-failure-diagnostic-v1'
+        self.assertNotIn('first_admission_error_code', a.validate_failure(encoded(old), RUN, self.source))
+        with self.assertRaises(a.AdmissionError): a.validate_failure(encoded({**old, 'first_admission_error_code': 'UNRESOLVED'}), RUN, self.source)
+        with self.assertRaises(a.AdmissionError): a.atomic_failure(self.raw, encoded(old), RUN, self.source)
+
+    def test_T18_network_defect_not_fixed(self):
+        value = self.pg_run(change=lambda c: c['NetworkSettings']['Networks']['job'].update(NetworkID='network-name'))
+        self.assertEqual(value['first_admission_error_code'], 'SERVICE_NETWORK')
+        workflow = (ci.ROOT / '.github/workflows/rg06d-e2e.yml').read_text()
+        self.assertIn('RG06D_SERVICE_NETWORK: ${{ job.services.postgres.network }}', workflow)
+        self.assertIn("{v['NetworkID'] for v in container['NetworkSettings']['Networks'].values()} == {network}",
+                      Path(a.__file__).read_text())
+
+    def test_T19_valid_json_does_not_prove_wrong_exception_path(self):
+        def wrong(): raise a.AdmissionError('SERVICE_NETWORK')
+        self.assertEqual(self.classify(wrong), ('ADMISSION_REJECTED', 'UNRESOLVED', 'UNRESOLVED'))
+        self.tracker(a.AdmissionError('SERVICE_NETWORK')); value = self.value()
+        forged = {**value, 'first_admission_error_code': 'SERVICE_NETWORK',
+                  'first_admission_call_site': 'A.SVC.NETWORK_ID_SET'}
+        # Demonstrate the limitation: structural validity is not execution proof.
+        a.validate_failure(encoded(forged), RUN, self.source)
+        self.assertNotEqual(value['first_admission_call_site'], forged['first_admission_call_site'])
+
+    def test_T20_cross_process_initial_failure_no_recovery(self):
+        with patch.object(a, 'confirm_capture', side_effect=OSError('between replace and marker removal')):
+            t = self.tracker(RuntimeError('first'))
+        before = a.read_failure(self.raw, RUN, self.source)
+        t.failed(RuntimeError('later')); t.save()
+        t.cleanup({'started': False}, {'started': False}, {'descendantsExited': True}, False)
+        self.assertEqual(a.read_failure(self.raw, RUN, self.source), before)
+        safe = self.directory / 'child-safe'; safe.mkdir()
+        script = ('import sys,json,pathlib; sys.path.insert(0,sys.argv[1]); '
+                  'import run_rg06d_ci as c; source=json.loads(sys.argv[4]); '
+                  'c.source_identity=lambda:source; p={"runOutcome":"failure"}; '
+                  'c.publish_failure(pathlib.Path(sys.argv[2]),pathlib.Path(sys.argv[3]),p); '
+                  'print(json.dumps(p))')
+        child = subprocess.run([sys.executable, '-B', '-c', script, str(Path(a.__file__).parent),
+                                str(self.raw), str(safe), json.dumps(self.source)],
+                               env={**os.environ, **ENV}, capture_output=True, text=True, timeout=15)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(json.loads(child.stdout)['diagnosticPublication'], 'DIAGNOSTIC_UNAVAILABLE')
+        self.assertFalse((safe / a.DIAGNOSTIC_NAME).exists())
+
+    def test_T21_coordinated_identity_substitution(self):
+        self.tracker(RuntimeError('first')); forged = copy.deepcopy(self.source)
+        forged.update(github_run_id='999', github_run_attempt='2', checkout_sha='f' * 40)
+        value = self.value(); identity, reference = a.diagnostic_binding('f' * 32, forged)
+        value.update(run_identity=identity, source_identity_reference=reference)
+        (self.raw / a.DIAGNOSTIC_NAME).write_bytes(encoded(value))
+        safe = self.local_publish(); self.assertFalse((safe / a.DIAGNOSTIC_NAME).exists())
+
+    def test_T22_final_local_zip_bytes_private(self):
+        markers = ['CONTROLLED_ADMISSION_SECRET', 'CONTROLLED_UNEXPECTED_SECRET', 'CONTROLLED_CAUSE_SECRET',
+                   'CONTROLLED_DOCKER_OUTPUT', 'postgresql://CONTROLLED_DSN:secret@host/db',
+                   'SELECT CONTROLLED_SQL', 'C:/CONTROLLED_SOURCE_PATH:123', 'CONTROLLED_STACK_TOKEN']
+        for index, marker in enumerate(markers):
+            self.tearDown_fixture()
+            error = a.AdmissionError(marker) if index == 0 else RuntimeError(marker)
+            error.__cause__ = RuntimeError(markers[2])
+            if index == 3:
+                self.pg_run(command_error=subprocess.CalledProcessError(1, ['docker'], output=marker, stderr=marker))
+            elif index == 4:
+                self.pg_run(driver_error=error)
+            elif index == 5:
+                self.pg_run(host_observed=OBS, query_error=error)
+            else:
+                self.tracker(error)
+            safe = self.local_publish()
+            archive = self.directory / 'local-publication.zip'
+            with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED) as z:
+                for f in safe.iterdir(): z.write(f, f.name)
+            with zipfile.ZipFile(archive) as z:
+                self.assertEqual(set(z.namelist()), {a.DIAGNOSTIC_NAME, 'publication-context.json', 'publication-manifest.json'})
+                manifest = json.loads(z.read('publication-manifest.json'))
+                for name in z.namelist():
+                    data = z.read(name)
+                    for sensitive in markers: self.assertNotIn(sensitive.encode(), data)
+                    if name in manifest['files']:
+                        self.assertEqual(manifest['files'][name], {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+            evidence = os.environ.get('RG06D_LOCAL_EVIDENCE')
+            if evidence: shutil.copyfile(archive, Path(evidence) / ('local-publication-' + str(index) + '.zip'))
+
+    def test_sentinel_create_remove_stale_and_directory_faults(self):
+        for mode in ('create', 'remove', 'stale', 'missing', 'untrusted'):
+            self.tearDown_fixture()
+            with ExitStack() as stack:
+                if mode == 'create': stack.enter_context(patch.object(a, 'begin_capture', side_effect=PermissionError('marker create')))
+                if mode == 'remove':
+                    real = Path.unlink
+                    def unlink(path, *args, **kwargs):
+                        if path.name == a.DIAGNOSTIC_DENIAL: raise PermissionError('marker remove')
+                        return real(path, *args, **kwargs)
+                    stack.enter_context(patch.object(Path, 'unlink', unlink))
+                if mode == 'stale': (self.raw / a.DIAGNOSTIC_DENIAL).write_bytes(b'foreign')
+                if mode == 'missing': self.raw.rmdir()
+                if mode == 'untrusted': stack.enter_context(patch.object(a, 'capture_directory', side_effect=a.AdmissionError('owner')))
+                t = self.tracker(RuntimeError('first')); self.assertFalse(t._persisted)
+                t.failed(RuntimeError('later'))
+            if mode != 'missing':
+                safe = self.local_publish(); self.assertFalse((safe / a.DIAGNOSTIC_NAME).exists())
+
+    @unittest.skipUnless(sys.implementation.name == 'cpython' and sys.version_info[:3] == (3, 12, 10),
+                         'Pinned CPython 3.12.10 unavailable; other versions are not equivalent evidence')
+    def test_pinned_3_12_10_attribution(self):
+        self.test_T03_distinct_network_predicates_actual_run()
+        self.tearDown_fixture(); self.test_T04_nested_shapes_parser_and_invocation_roles()
 
 
 if __name__ == '__main__':

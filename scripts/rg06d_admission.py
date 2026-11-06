@@ -1,4 +1,6 @@
 """Test-only RG-06D identity/evidence admission. No import-time I/O or driver imports."""
+import ast
+import dis
 import hashlib
 import ipaddress
 import json
@@ -7,6 +9,7 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+from types import CodeType
 
 
 class AdmissionError(Exception):
@@ -71,6 +74,7 @@ def source_oid(value):
 
 DIAGNOSTIC_NAME = 'failure-diagnostic.json'
 DIAGNOSTIC_LIMIT = 2048
+DIAGNOSTIC_DENIAL = '.failure-capture-unavailable'
 DIAGNOSTIC_STAGES = ('EARLY_CHECKS', 'SOURCE_INTEGRITY', 'OWNERSHIP_UNIT', 'PG_PRELOAD',
                      'RUNTIME_PACKAGES', 'POSTGRESQL_ADMISSION', 'API_SERVER', 'CHROMIUM',
                      'EVIDENCE_VALIDATION', 'PROCESS_CLEANUP')
@@ -106,10 +110,15 @@ def diagnostic_binding(run, source):
 def validate_failure(raw, run, source):
     require(type(raw) is bytes and 0 < len(raw) <= DIAGNOSTIC_LIMIT, 'DIAGNOSTIC_SIZE')
     value = parse(raw)
-    shape(value, ('schema_version', 'run_identity', 'source_identity_reference',
-                  'last_completed_runtime_stage', 'first_failed_runtime_stage',
-                  'allowlisted_failure_code', 'cleanup_status'))
-    require(value['schema_version'] == 'rg06d-failure-diagnostic-v1', 'DIAGNOSTIC_VERSION')
+    require(type(value) is dict, 'DIAGNOSTIC_FIELDS')
+    version = value.get('schema_version')
+    require(type(version) is str and version in
+            ('rg06d-failure-diagnostic-v1', 'rg06d-failure-diagnostic-v2'), 'DIAGNOSTIC_VERSION')
+    keys = ('schema_version', 'run_identity', 'source_identity_reference',
+            'last_completed_runtime_stage', 'first_failed_runtime_stage',
+            'allowlisted_failure_code', 'cleanup_status')
+    shape(value, keys + (('first_admission_error_code', 'first_admission_call_site')
+                         if version == 'rg06d-failure-diagnostic-v2' else ()))
     identity, reference = diagnostic_binding(run, source)
     shape(value['run_identity'], identity)
     shape(value['source_identity_reference'], reference)
@@ -128,7 +137,227 @@ def validate_failure(raw, run, source):
     require(value['allowlisted_failure_code'] in (*DIAGNOSTIC_CODES[stage], 'ADMISSION_REJECTED', 'EXECUTION_EXCEPTION'),
             'DIAGNOSTIC_CODE')
     require(value['cleanup_status'] in DIAGNOSTIC_CLEANUP, 'DIAGNOSTIC_CLEANUP')
+    if version == 'rg06d-failure-diagnostic-v2':
+        validate_first_admission(value)
     return value
+
+
+def validate_first_admission(value):
+    code, site = value['first_admission_error_code'], value['first_admission_call_site']
+    require(all(type(v) is str and 0 < len(v) <= 64 for v in (code, site)), 'DIAGNOSTIC_FIRST_TYPE')
+    broad = value['allowlisted_failure_code']
+    if value['first_failed_runtime_stage'] != 'POSTGRESQL_ADMISSION':
+        require((code, site) == ('NOT_APPLICABLE', 'NOT_APPLICABLE'), 'DIAGNOSTIC_FIRST_STAGE')
+        return
+    if broad == 'EXECUTION_EXCEPTION':
+        require((code, site) == ('EXECUTION_EXCEPTION', 'UNRESOLVED'), 'DIAGNOSTIC_FIRST_PAIR')
+        return
+    family = 'R.' if broad != 'ADMISSION_REJECTED' else ('A.', 'P.')
+    compatible = {entry[0] for entry in FIRST_ERROR_REGISTRY
+                  if entry[0].startswith(family) and entry[1] == code}
+    if broad == 'ADMISSION_REJECTED' and code == 'UNRESOLVED':
+        require(site == 'UNRESOLVED', 'DIAGNOSTIC_FIRST_PAIR')
+    else:
+        require(bool(compatible) and (broad == 'ADMISSION_REJECTED' or code == broad)
+                and (site == 'UNRESOLVED' or site in compatible), 'DIAGNOSTIC_FIRST_PAIR')
+
+
+def capture_directory(directory):
+    """Owned, existing execution directory; never create or repair a foreign tree."""
+    directory = Path(directory)
+    diagnostic_path(directory)
+    require(re.fullmatch('[a-f0-9]{32}', directory.name) is not None, 'DIAGNOSTIC_RUN')
+    info = directory.lstat()
+    if hasattr(os, 'geteuid'):
+        require(info.st_uid == os.geteuid() and not info.st_mode & 0o022, 'DIAGNOSTIC_OWNER')
+    return info.st_dev, info.st_ino
+
+
+def capture_denied(directory):
+    capture_directory(directory)
+    # lstat, not exists: dangling symlinks and inspection errors also deny.
+    try:
+        (Path(directory) / DIAGNOSTIC_DENIAL).lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def begin_capture(directory):
+    identity = capture_directory(directory)
+    final = diagnostic_path(directory)
+    require(not final.exists() and not final.is_symlink(), 'DIAGNOSTIC_CAPTURE_EXISTS')
+    marker = Path(directory) / DIAGNOSTIC_DENIAL
+    with marker.open('xb') as stream:
+        marker_info = os.fstat(stream.fileno())
+        stream.write(b'CAPTURE_NOT_CONFIRMED\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    require(capture_directory(directory) == identity, 'DIAGNOSTIC_DIRECTORY_CHANGED')
+    return identity, (marker_info.st_dev, marker_info.st_ino)
+
+
+def confirm_capture(directory, identity, raw, run, source):
+    require(capture_directory(directory) == identity[0], 'DIAGNOSTIC_DIRECTORY_CHANGED')
+    require(read_failure(directory, run, source) == raw, 'DIAGNOSTIC_CAPTURE_CHANGED')
+    marker = Path(directory) / DIAGNOSTIC_DENIAL
+    info = marker.lstat()
+    require(stat.S_ISREG(info.st_mode) and not marker.is_symlink()
+            and (info.st_dev, info.st_ino) == identity[1]
+            and not getattr(info, 'st_file_attributes', 0) & 0x400
+            and info.st_nlink == 1 and info.st_size == 22, 'DIAGNOSTIC_MARKER')
+    with marker.open('rb') as stream:
+        opened = os.fstat(stream.fileno())
+        require((opened.st_dev, opened.st_ino) == identity[1]
+                and stat.S_ISREG(opened.st_mode) and opened.st_size == 22,
+                'DIAGNOSTIC_MARKER')
+        require(stream.read(23) == b'CAPTURE_NOT_CONFIRMED\n', 'DIAGNOSTIC_MARKER')
+    marker.unlink()
+
+
+def ast_fingerprint(node):
+    return hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+
+
+def function_nodes(tree):
+    result = {}
+    def visit(node, prefix=''):
+        if isinstance(node, ast.FunctionDef):
+            prefix = prefix + '.<locals>.' + node.name if prefix else node.name
+            result[prefix] = node
+        for child in ast.iter_child_nodes(node):
+            visit(child, prefix)
+    visit(tree)
+    return result
+
+
+def nested_codes(code):
+    yield code
+    for child in code.co_consts:
+        if isinstance(child, CodeType):
+            yield from nested_codes(child)
+
+
+def registry_model(source, runner_codes):
+    """Re-admit source and loaded code; no registry lookup by mutable line number."""
+    paths = {'A': Path(__file__), 'C': Path(__file__).with_name('run_rg06d_ci.py')}
+    loaded = FIRST_ERROR_HELPER_CODES + runner_codes
+    models = {}
+    for module, path in paths.items():
+        raw = path.read_bytes()
+        require(source['inputs'].get('scripts/' + path.name) == hashlib.sha256(raw).hexdigest(),
+                'DIAGNOSTIC_REGISTRY_SOURCE')
+        nodes = function_nodes(ast.parse(raw))
+        compiled = {code.co_qualname: code for code in nested_codes(
+            compile(raw, str(path), 'exec', dont_inherit=True, optimize=0))}
+        for label, live in loaded:
+            if label != module:
+                continue
+            name = live.co_qualname
+            require((module, name) in FIRST_ERROR_FUNCTION_HASHES
+                    and ast_fingerprint(nodes[name]) == FIRST_ERROR_FUNCTION_HASHES[module, name]
+                    and live == compiled[name], 'DIAGNOSTIC_REGISTRY_CODE')
+            models[module, name] = (live, nodes[name])
+    require(len(FIRST_ERROR_REGISTRY) == 62
+            and len({entry[0] for entry in FIRST_ERROR_REGISTRY}) == 62,
+            'DIAGNOSTIC_REGISTRY_DUPLICATE')
+    for identifier, code, chain in FIRST_ERROR_REGISTRY:
+        require(type(identifier) is str and len(identifier) <= 64
+                and re.fullmatch('[A-Z0-9._]+', identifier) and chain, 'DIAGNOSTIC_REGISTRY_ID')
+        for module, name, fingerprint in chain:
+            node = models[module, name][1]
+            require(sum(ast_fingerprint(n) == fingerprint for n in ast.walk(node)
+                        if isinstance(n, (ast.Call, ast.Raise))) == 1, 'DIAGNOSTIC_REGISTRY_OPERATION')
+    return models
+
+
+def traceback_operation(trace, node):
+    """Match an instruction's full span; CACHE belongs to its preceding opcode."""
+    owner = None
+    instruction = None
+    for item in dis.get_instructions(trace.tb_frame.f_code, show_caches=True, adaptive=False):
+        if item.opname != 'CACHE':
+            owner = item
+        if item.offset == trace.tb_lasti:
+            if item.opname == 'CACHE':
+                if owner is None or owner.positions != item.positions:
+                    return None
+                instruction = owner
+            else:
+                instruction = item
+            break
+    if instruction is None or instruction.opname not in ('CALL', 'RAISE_VARARGS'):
+        return None
+    pos = instruction.positions
+    if None in (pos.lineno, pos.end_lineno, pos.col_offset, pos.end_col_offset):
+        return None
+    matches = [n for n in ast.walk(node) if isinstance(n, (ast.Call, ast.Raise))
+               and (n.lineno, n.end_lineno, n.col_offset, n.end_col_offset) ==
+               (pos.lineno, pos.end_lineno, pos.col_offset, pos.end_col_offset)]
+    return ast_fingerprint(matches[0]) if len(matches) == 1 else None
+
+
+def attribute_first_error(error, stage, source, runner_codes, stop_type):
+    """Only the caught object supplies the code. Schema membership is not provenance."""
+    args = error.args if type(error) in (AdmissionError, stop_type) else ()
+    candidate = args[0] if len(args) == 1 and type(args[0]) is str else None
+    if stage != 'POSTGRESQL_ADMISSION':
+        broad = (candidate if type(error) is stop_type and candidate in DIAGNOSTIC_CODES[stage]
+                 else 'ADMISSION_REJECTED' if type(error) is AdmissionError else 'EXECUTION_EXCEPTION')
+        return broad, 'NOT_APPLICABLE', 'NOT_APPLICABLE'
+    helper = type(error) is AdmissionError
+    fallback = ('ADMISSION_REJECTED', 'UNRESOLVED', 'UNRESOLVED') if helper else (
+        'EXECUTION_EXCEPTION', 'EXECUTION_EXCEPTION', 'UNRESOLVED')
+    if type(error) not in (AdmissionError, stop_type) or candidate is None:
+        return fallback
+    try:
+        models = registry_model(source, runner_codes)
+        traces = []
+        trace = error.__traceback__
+        while trace is not None:
+            if len(traces) == 64:
+                return fallback
+            traces.append(trace)
+            trace = trace.tb_next
+        if not traces:
+            return fallback
+        own = {id(live): (module, name, node) for (module, name), (live, node) in models.items()}
+        known = []
+        for trace in reversed(traces):
+            record = own.get(id(trace.tb_frame.f_code))
+            if record is None:
+                # Only JSON's known implementation frames may intervene in parser hooks.
+                if known and known[-1][1].startswith('parse') and trace.tb_frame.f_code in (
+                        json.loads.__code__, json.JSONDecoder.decode.__code__, json.JSONDecoder.raw_decode.__code__):
+                    continue
+                break
+            module, name, node = record
+            known.append((module, name, traceback_operation(trace, node)))
+        family = ('A.', 'P.') if helper else 'R.'
+        eligible = [entry for entry in FIRST_ERROR_REGISTRY
+                    if entry[0].startswith(family) and entry[1] == candidate]
+        if not eligible:
+            return fallback
+        # Shared require is necessary, never sufficient. Direct lexical parser raises
+        # are separately registered; a familiar code raised elsewhere is unsupported.
+        shared = ('A' if helper else 'C', 'require')
+        if known and known[0][:2] == shared:
+            root = models[shared][1]
+            raises = [ast_fingerprint(n) for n in ast.walk(root) if isinstance(n, ast.Raise)]
+            if known[0][2] not in raises:
+                return fallback
+            known = known[1:]
+        elif not (helper and known and known[0][1] in ('parse', 'parse.<locals>.constant')):
+            return fallback
+        # A supported actual leaf is required even to preserve the original code.
+        supported = [entry for entry in eligible if known and entry[2][0] == known[0]]
+        if not supported:
+            return fallback
+        broad = 'ADMISSION_REJECTED' if helper else candidate
+        exact = [entry[0] for entry in supported if tuple(known) == entry[2]]
+        return broad, candidate, exact[0] if len(exact) == 1 else 'UNRESOLVED'
+    except Exception:
+        return fallback
 
 
 def diagnostic_path(directory):
@@ -498,3 +727,92 @@ def api_main():
 
 if __name__ == '__main__':
     api_main()
+
+
+# Reviewed semantic sites. SHA-256 values bind normalized AST operations, not lines.
+FIRST_ERROR_REGISTRY = (
+    ('R.PG.PORT', 'DB_PORT', (('C', 'run_tests', '760bc43470115ff3426ae3b8257a0538593b3dec852ddec2b4023d7f17487956'),)),
+    ('R.PG.CREDENTIAL', 'CI_SERVICE_CREDENTIAL', (('C', 'run_tests', '11018020dc0c95b5e3e44b3badb262172a5687a8249a3e955160a24d328fdc6c'),)),
+    ('R.PG.DB_ID', 'DB_IDENTITY', (('C', 'run_tests', '92b173e9852fd5145ec64a35f6d441841b44e1244cb5b05c65df3080a9cef333'),)),
+    ('R.PG.FRESH', 'DB_NOT_FRESH', (('C', 'run_tests', '494e97c914bbcc60b52da20ef520e6e6f078ac555a63564e303ad7a5b1a89f70'),)),
+    ('R.PG.EMPTY', 'DB_NOT_EMPTY', (('C', 'run_tests', 'a9c62e74c9422ee1536f2152731f314cce04b03aaf4deeaf90a6c245a94379c2'),)),
+    ('R.SVC.HOSTED', 'HOSTED_RUNNER_REQUIRED', (('C', 'service_admission', 'ed85b483c228cdbb1a0c9c014f6434e788b647e0da015e88b324c08ca8459754'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('R.SVC.NO_OVERRIDE', 'DOCKER_OVERRIDE', (('C', 'service_admission', '321d15d3403a31d3ed3a9fc0aac83b10e45867f316b40e0837178795e82967dc'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('R.SVC.ENDPOINT', 'JOB_DOCKER_ENDPOINT', (('C', 'service_admission', '19aa029f5b940fcc01729cdea90b3801ebd9ff4b488cdd09d7e3cfa8eb339f42'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('R.SVC.ENGINE', 'ENGINE_ID', (('C', 'service_admission', 'b803fe9fa543f21b5237494f49275022fa5f86a2d1060b0ab033e10537a55294'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('R.SVC.ID', 'SERVICE_ID', (('C', 'service_admission', '18f38a09d2adf6ef01aaf34e75ebb8851fb883ed9c6ebac0496c5ddcfa925a88'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('R.SVC.DIGEST', 'SERVICE_IMAGE_DIGEST', (('C', 'service_admission', '439c6a2d3124de3b0b24c38b7b8aa3651b965c950e81db55c09776fa2554b8a1'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.ID', 'SERVICE_ID', (('A', 'validate_service', '8addd2f9b052c429813d2ad653ecd031cee4d72feb94fe8b33f271e18779913c'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.IDENTITY', 'SERVICE_IDENTITY', (('A', 'validate_service', '39bcadd3558e679bbdece7938f7076c043cc83a2a448de30c36cd929e2668f5e'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.HEALTH', 'SERVICE_HEALTH', (('A', 'validate_service', '41e7ea800299fe9ad9418c422dbb74cff3faf415b9a2bde55bfae161a6183160'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.ARCH', 'SERVICE_ARCH', (('A', 'validate_service', '83571c748a09f54c91eee23a33333bfbc85979e0db6cee217c282fbdad7b808d'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.NETWORK_ID_SET', 'SERVICE_NETWORK', (('A', 'validate_service', '5f36dd577109d645f0dcae9ca65cc8eb33115bbba81a2c18df4c09ff458db19f'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.PORT_KEYS', 'SERVICE_EXPOSED_PORTS', (('A', 'validate_service', 'ae33c48e39feee2fd055ad61287c3b4f5b1b8085cf849f122783de25c6d99c20'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.NETWORK_COUNT', 'SERVICE_NETWORK', (('A', 'validate_service', '96397de25e349a3c93ddd3d8c50c44310b556d716aeab9a9f6abe879ede1785b'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.ADDRESS', 'SERVICE_ADDRESS', (('A', 'validate_service', '9560e5d36879081cb14912591e7c4d8621e8c4ca40e138738896fddd4a66356e'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.NO_BIND', 'SERVICE_BIND', (('A', 'validate_service', 'bb17c1e23f993781e04b175c7a666ecf5cc796c38eb3443a90190924578be4c5'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVC.PGDATA', 'SERVICE_STORAGE', (('A', 'validate_service', '09baa2e4bb39156ac35498ebfafc62c9980a1c902bfa203b6e54d913a8e7cc72'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.PORT_INPUT', 'SERVICE_PORT', (('A', 'validate_bindings', '14738e5ea9b60ca0e96eb2959497af50cc4dfd8512bc1cdf9a7dfb9364a8ed74'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.COUNT', 'SERVICE_BINDINGS', (('A', 'validate_bindings', '361722cb7a483d7de27999fb4982fe0d15f1fe424a351660206703bd82524a42'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.ITEM_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_bindings', '15a6ca75a362284c5d0216a024516fc6318dc38cc479ea7c4982bfdf4b16e6a7'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.PORT_MATCH', 'SERVICE_PORT', (('A', 'validate_bindings', '35060dbf7c3a1710573dbc6963eff8938a376d12aeb6f72d2879cb94611c4182'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.IP_TYPE', 'SERVICE_HOSTIP', (('A', 'validate_bindings', 'c6d6c9dc715ece54e5eed561f8021cd4321ecc5d85a959ea604c8d0044738653'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.BIND.IP_SET', 'SERVICE_HOSTIP', (('A', 'validate_bindings', '9c0fb25d8e41d22cf7d26a5f72e89c0ac051d09407f258c9d0c5d8f28fbb69a6'), ('A', 'validate_service', 'deb5a4e2dc8fdb7754659f2c0e677fa2038a6870d755247756bf6334033fea19'), ('C', 'service_admission', '4120b5ff0a2373341f32e329696707cc8ab766046bfa72bb4903e36cee47c74d'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVCID.OBS_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_identity', '344ac419fad4fa33a11edf7235937b5a5238f35d4e79ff1e4f542befff5dc2e3'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVCID.FP_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_identity', 'c76301082df8ac9853579fcf5ce1db69e53e08452da12d6198c7dd0cc8a766b6'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVCID.PATH_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_identity', '88087867c4ed9bcd9f0c69e3122c5845bfa52f2d6e0cf3a0cfede94e7261a1a5'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVCID.FP_MATCH', 'BACKEND_IDENTITY_MISMATCH', (('A', 'validate_identity', 'a6b2b2fa69949044953ff269f0bb2cbb917b8583327143c556b00b899bcf8e61'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVCID.PRINCIPAL', 'BACKEND_PRINCIPAL', (('A', 'validate_identity', '069bc53db72a01a4e8794bbf6d5ed49e57c323d7377ef4c63c733ded262f3343'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVCID.SYSTEM', 'BACKEND_SYSTEM', (('A', 'validate_identity', 'b4d9fa7640b09c026faa14d04a001865040951992b5829a6ae61f03ad71b0968'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVCID.PATH', 'BACKEND_PATH', (('A', 'validate_identity', 'ea278a19b56e0c588ddcea3eb205ac80b1cd8fe0efa39cfac90b66b7ce42fbe1'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVCID.ADDRESS', 'BACKEND_ADDRESS', (('A', 'validate_identity', '9af1548e650e5593eba4281d136bbd484e8f5613133d5a2127c552c15afed61b'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.SVCID.PID', 'BACKEND_PID', (('A', 'validate_identity', '4abc573906873e15821dc22221dd529bd4e18a0c7557de78fcd839ec56b4bae1'), ('C', 'service_admission', '0d20d62cdbf632b2fc9da34bb9e65b482cbc8089714932657cc3c96200d576aa'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('A.HOSTID.OBS_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_identity', '344ac419fad4fa33a11edf7235937b5a5238f35d4e79ff1e4f542befff5dc2e3'), ('C', 'run_tests', 'c91469bb6bc0ed9827f7c0f03437d98ace9cca3636ac03a785437a97adf37c37'))),
+    ('A.HOSTID.FP_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_identity', 'c76301082df8ac9853579fcf5ce1db69e53e08452da12d6198c7dd0cc8a766b6'), ('C', 'run_tests', 'c91469bb6bc0ed9827f7c0f03437d98ace9cca3636ac03a785437a97adf37c37'))),
+    ('A.HOSTID.PATH_FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_identity', '88087867c4ed9bcd9f0c69e3122c5845bfa52f2d6e0cf3a0cfede94e7261a1a5'), ('C', 'run_tests', 'c91469bb6bc0ed9827f7c0f03437d98ace9cca3636ac03a785437a97adf37c37'))),
+    ('A.HOSTID.FP_MATCH', 'BACKEND_IDENTITY_MISMATCH', (('A', 'validate_identity', 'a6b2b2fa69949044953ff269f0bb2cbb917b8583327143c556b00b899bcf8e61'), ('C', 'run_tests', 'c91469bb6bc0ed9827f7c0f03437d98ace9cca3636ac03a785437a97adf37c37'))),
+    ('A.HOSTID.PRINCIPAL', 'BACKEND_PRINCIPAL', (('A', 'validate_identity', '069bc53db72a01a4e8794bbf6d5ed49e57c323d7377ef4c63c733ded262f3343'), ('C', 'run_tests', 'c91469bb6bc0ed9827f7c0f03437d98ace9cca3636ac03a785437a97adf37c37'))),
+    ('A.HOSTID.SYSTEM', 'BACKEND_SYSTEM', (('A', 'validate_identity', 'b4d9fa7640b09c026faa14d04a001865040951992b5829a6ae61f03ad71b0968'), ('C', 'run_tests', 'c91469bb6bc0ed9827f7c0f03437d98ace9cca3636ac03a785437a97adf37c37'))),
+    ('A.HOSTID.PATH', 'BACKEND_PATH', (('A', 'validate_identity', 'ea278a19b56e0c588ddcea3eb205ac80b1cd8fe0efa39cfac90b66b7ce42fbe1'), ('C', 'run_tests', 'c91469bb6bc0ed9827f7c0f03437d98ace9cca3636ac03a785437a97adf37c37'))),
+    ('A.HOSTID.ADDRESS', 'BACKEND_ADDRESS', (('A', 'validate_identity', '9af1548e650e5593eba4281d136bbd484e8f5613133d5a2127c552c15afed61b'), ('C', 'run_tests', 'c91469bb6bc0ed9827f7c0f03437d98ace9cca3636ac03a785437a97adf37c37'))),
+    ('A.HOSTID.PID', 'BACKEND_PID', (('A', 'validate_identity', '4abc573906873e15821dc22221dd529bd4e18a0c7557de78fcd839ec56b4bae1'), ('C', 'run_tests', 'c91469bb6bc0ed9827f7c0f03437d98ace9cca3636ac03a785437a97adf37c37'))),
+    ('A.TARGET.FIELDS', 'ADMISSION_FIELDS', (('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434'), ('A', 'validate_client_target', 'c5fe6dad08eecd1f4b0d191c49269ab2b995bfad439cf21cc2803cb7116d4e74'), ('C', 'run_tests', 'c54e67affff0519cef83945997ce04e0df8eddde6067b2ce39334a07e6dab163'))),
+    ('A.TARGET.MATCH', 'CLIENT_TARGET', (('A', 'validate_client_target', 'd01845e8dceeaa21d81ca1aadb5a337e6a743a84cc425ed11210a0c9365fd33e'), ('C', 'run_tests', 'c54e67affff0519cef83945997ce04e0df8eddde6067b2ce39334a07e6dab163'))),
+    ('A.OBS.IDLE', 'IDENTITY_CONNECTION_NOT_IDLE', (('A', 'observe', 'bc7703db92dd7adc3c9e66334891cb15f4f19f035d2fde2a09f6bb023e275106'), ('C', 'run_tests', '590b01776fc98b4201339ccd38f982ab6deb1170ec88bd984bcf82550c43bce0'))),
+    ('A.OBS.ROW', 'IDENTITY_MISSING', (('A', 'observe', '4e6b34e7ad3fd895e9464f680d5b8bbff4bfced22d46c3ff0fc7978a8c2ffe0c'), ('C', 'run_tests', '590b01776fc98b4201339ccd38f982ab6deb1170ec88bd984bcf82550c43bce0'))),
+    ('A.OBS.TX_END', 'IDENTITY_TRANSACTION_STATE', (('A', 'observe', 'e03656e463e4344977f26e27c614dcd88c6d8395081923d9c58b56ae4b1c8854'), ('C', 'run_tests', '590b01776fc98b4201339ccd38f982ab6deb1170ec88bd984bcf82550c43bce0'))),
+    ('P.CONTAINER.SIZE', 'ADMISSION_SIZE', (('A', 'parse', '9e879d17b6bb6ecce8376c71815c39cbd51bd54d5e50a02d4a40e894ba4ba589'), ('C', 'service_admission', '0919edebdb8747ffc87cb489bfa1ddf5004863818aa051c12cd33b4cef998785'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.CONTAINER.DUPLICATE', 'ADMISSION_DUPLICATE_KEY', (('A', 'parse.<locals>.pairs', '6a94a3ee0f0923d97393de748791c68a7cefc16b758432eb18c478798dcba5f6'), ('A', 'parse', 'cd97788a4359e646afd0649face0855e41938cd3738aa3e8bbb6b2e07dec9710'), ('C', 'service_admission', '0919edebdb8747ffc87cb489bfa1ddf5004863818aa051c12cd33b4cef998785'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.CONTAINER.NONFINITE', 'ADMISSION_NONFINITE', (('A', 'parse.<locals>.constant', 'fe00cc081878eff5d8e9bf88c7e30fb1bb3e362c2df46d24b667e23d20ad24f4'), ('A', 'parse', 'cd97788a4359e646afd0649face0855e41938cd3738aa3e8bbb6b2e07dec9710'), ('C', 'service_admission', '0919edebdb8747ffc87cb489bfa1ddf5004863818aa051c12cd33b4cef998785'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.CONTAINER.JSON', 'ADMISSION_JSON', (('A', 'parse', '3f41418c7aa2b530cd1fdb13cb8c6093f69da2fc6059c990e731e6ea42344813'), ('C', 'service_admission', '0919edebdb8747ffc87cb489bfa1ddf5004863818aa051c12cd33b4cef998785'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.IMAGE.SIZE', 'ADMISSION_SIZE', (('A', 'parse', '9e879d17b6bb6ecce8376c71815c39cbd51bd54d5e50a02d4a40e894ba4ba589'), ('C', 'service_admission', 'cc2ea967cea58644aec88810218ba4aee052a798884eabf8323b0c6ee6590aad'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.IMAGE.DUPLICATE', 'ADMISSION_DUPLICATE_KEY', (('A', 'parse.<locals>.pairs', '6a94a3ee0f0923d97393de748791c68a7cefc16b758432eb18c478798dcba5f6'), ('A', 'parse', 'cd97788a4359e646afd0649face0855e41938cd3738aa3e8bbb6b2e07dec9710'), ('C', 'service_admission', 'cc2ea967cea58644aec88810218ba4aee052a798884eabf8323b0c6ee6590aad'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.IMAGE.NONFINITE', 'ADMISSION_NONFINITE', (('A', 'parse.<locals>.constant', 'fe00cc081878eff5d8e9bf88c7e30fb1bb3e362c2df46d24b667e23d20ad24f4'), ('A', 'parse', 'cd97788a4359e646afd0649face0855e41938cd3738aa3e8bbb6b2e07dec9710'), ('C', 'service_admission', 'cc2ea967cea58644aec88810218ba4aee052a798884eabf8323b0c6ee6590aad'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.IMAGE.JSON', 'ADMISSION_JSON', (('A', 'parse', '3f41418c7aa2b530cd1fdb13cb8c6093f69da2fc6059c990e731e6ea42344813'), ('C', 'service_admission', 'cc2ea967cea58644aec88810218ba4aee052a798884eabf8323b0c6ee6590aad'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.PSQL.SIZE', 'ADMISSION_SIZE', (('A', 'parse', '9e879d17b6bb6ecce8376c71815c39cbd51bd54d5e50a02d4a40e894ba4ba589'), ('C', 'service_admission', '7a8bd9ab002b546d6dac81b2ca01b80d5ef896cc0d97228669edcd6c13012609'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.PSQL.DUPLICATE', 'ADMISSION_DUPLICATE_KEY', (('A', 'parse.<locals>.pairs', '6a94a3ee0f0923d97393de748791c68a7cefc16b758432eb18c478798dcba5f6'), ('A', 'parse', 'cd97788a4359e646afd0649face0855e41938cd3738aa3e8bbb6b2e07dec9710'), ('C', 'service_admission', '7a8bd9ab002b546d6dac81b2ca01b80d5ef896cc0d97228669edcd6c13012609'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.PSQL.NONFINITE', 'ADMISSION_NONFINITE', (('A', 'parse.<locals>.constant', 'fe00cc081878eff5d8e9bf88c7e30fb1bb3e362c2df46d24b667e23d20ad24f4'), ('A', 'parse', 'cd97788a4359e646afd0649face0855e41938cd3738aa3e8bbb6b2e07dec9710'), ('C', 'service_admission', '7a8bd9ab002b546d6dac81b2ca01b80d5ef896cc0d97228669edcd6c13012609'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+    ('P.PSQL.JSON', 'ADMISSION_JSON', (('A', 'parse', '3f41418c7aa2b530cd1fdb13cb8c6093f69da2fc6059c990e731e6ea42344813'), ('C', 'service_admission', '7a8bd9ab002b546d6dac81b2ca01b80d5ef896cc0d97228669edcd6c13012609'), ('C', 'run_tests', 'f86d192706a8864ca6a2c848452d0739825af851e55b12f4f7053094e3a9f297'))),
+)
+
+
+FIRST_ERROR_HELPER_CODES = tuple(('A', code) for f in (require, shape, parse, validate_service,
+    validate_bindings, validate_identity, validate_client_target, observe) for code in
+    (nested_codes(f.__code__) if f is parse else (f.__code__,)))
+
+
+FIRST_ERROR_FUNCTION_HASHES = {
+    ('A', 'require'): '2c87fcb719ea6926e19c5f0aa7181d237f4bc16a2cfca703c00c51a9771d0cb1',
+    ('A', 'shape'): '591fccfd5ae5148362f020ebf2eea35be0cdd6c1200f70dc055d760a409fe319',
+    ('A', 'parse'): '231ee7d9a47e3a56ded5945cef152759c6c3e14e7369b160fa0c3b9b5d7dd895',
+    ('A', 'parse.<locals>.pairs'): '437d2af775ff146249c87aed7f4418d17a154eac1a1646251feb794007aa11d7',
+    ('A', 'parse.<locals>.constant'): '210e79266c47524300ca4b784d1007959af5207ac570d57bc7dca28c43c2ce9c',
+    ('A', 'validate_identity'): '2c3a00301efa0b2629ab3394879f16b4502fae06f8cb3a8813e565e7420f3be2',
+    ('A', 'validate_client_target'): 'd5b5bb06e0e53e2cd9f4bf67d2253c8b396cd86b67c1f192c0856f2233b0d1eb',
+    ('A', 'validate_bindings'): 'dd2de9537ecd9610270e5ba496c9535a33b7aaad86e1a06d38e6b2fee473c8c0',
+    ('A', 'observe'): 'f862eb2ef3388f6fda78b8e5322257b1605a64cf491480b0e8ca931717c8c18d',
+    ('A', 'validate_service'): '3d326cfa99ad5a8d10fe8e376dbe744ab9b79219c3c7f482de81fb271f68cabe',
+    ('C', 'require'): 'ba2fe4aedf7ede9bf717f2378bb6e7735b27a15ffd6793b6e1772a21374ecc22',
+    ('C', 'service_admission'): '4cfea7ed900f24a7c52bc068d40551e89a80f8252563bb4c13fd356edaf106e8',
+    ('C', 'run_tests'): '21f21da3b844f2b78bcf16e9bf157de83e9d75d3f0f84448cb0f3e97a9adbd5d',
+}
