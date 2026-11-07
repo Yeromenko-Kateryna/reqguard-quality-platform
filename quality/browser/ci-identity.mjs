@@ -9,7 +9,7 @@ import { isIP } from 'node:net';
 export const identitySql = `SELECT current_database()::text AS db, current_user::text AS role,
  current_setting('server_version_num') AS version,
  (SELECT system_identifier::text FROM pg_control_system()) AS system_id,
- inet_server_addr()::text AS address, inet_server_port() AS port,
+ host(inet_server_addr()) AS address, inet_server_port() AS port,
  pg_backend_pid() AS backend_pid`;
 
 export function verifyIdentity(observed, expected, serverPath) {

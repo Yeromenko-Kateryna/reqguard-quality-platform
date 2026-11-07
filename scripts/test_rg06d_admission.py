@@ -277,6 +277,18 @@ class FakeConnection:
 
 
 class IdentityTests(unittest.TestCase):
+    def test_identity_sql_uses_plain_host_addresses_in_both_languages(self):
+        result = subprocess.run(
+            ['node', '--input-type=module', '-e',
+             'import {identitySql} from ' + json.dumps((ci.PACKAGE / 'ci-identity.mjs').as_uri())
+             + '; process.stdout.write(identitySql);'],
+            env={**os.environ, 'RG06D_NODE_IDENTITY': '0'},
+            capture_output=True, text=True, check=True, timeout=10)
+        for language, sql in (('python', a.IDENTITY_SQL), ('node', result.stdout)):
+            with self.subTest(language=language):
+                self.assertIn('host(inet_server_addr()) AS address', sql)
+                self.assertNotIn('inet_server_addr()::text', sql)
+
     def test_host_bindings_are_exact_and_unambiguous(self):
         good = {'HostIp': '0.0.0.0', 'HostPort': '49123'}
         a.validate_bindings([good], '49123')
