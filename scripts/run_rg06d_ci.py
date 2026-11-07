@@ -1,14 +1,16 @@
 """RG-06D only: Linux hosted CI, existing RG-06B specs, safe publication.
 
 prepare/publish use only stdlib, including after dependency setup fails.
-No Docker commands: GitHub owns service disposal, which this file cannot attest.
+Read-only Docker admission only: GitHub owns service disposal, which this file cannot attest.
 """
 
 import ctypes
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 import stat
 import hashlib
 import importlib.metadata
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -18,9 +20,12 @@ import socket
 import subprocess
 import sys
 import time
+import threading
 import tomllib
 import urllib.request
 import uuid
+from types import MappingProxyType
+import rg06d_admission as admission
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,12 +37,20 @@ INPUTS = ['pyproject.toml', 'uv.lock', 'db/001_init.sql', 'reqguard/main.py',
           'reqguard/static/style.css', 'quality/browser/package.json',
           'quality/browser/package-lock.json', 'quality/browser/analyses.spec.ts',
           'quality/browser/playwright.config.ts', 'quality/browser/playwright.ci.config.ts',
-          'scripts/run_rg06d_ci.py', '.github/workflows/rg06d-e2e.yml']
+          'scripts/run_rg06d_ci.py', '.github/workflows/rg06d-e2e.yml',
+          'quality/browser/owned-cleanup.ts', 'quality/browser/owned-cleanup.test.ts',
+          'quality/browser/ci-identity.mjs', 'quality/browser/unit-reporter.mjs',
+          'scripts/rg06d_admission.py', 'scripts/test_rg06d_admission.py',
+          'quality/browser/ci-identity.test.mjs', 'quality/browser/ci-preload.integration.test.mjs',
+          'quality/browser/ci-preload-checks.mjs', 'quality/browser/ci-preload-gate.test.mjs']
+ADMISSION_FILES = ['ownership-preservation.json', 'ownership.json', 'ownership-unit.json',
+                   'service-identity.json', 'connections.json', 'pg-preload.json']
 JSON_ALLOWLIST = ['launch.json', 'postgres-ready.json', 'baseline.json', 'sentinel-plan.json',
                   'supported-response-id.json', 'supported-sql.json', 'invalid-sql.json',
                   'supported-cleanup.json', 'unsupported-response-id.json', 'unsupported-sql.json',
                   'unsupported-cleanup.json', 'sql-cleanup.json', 'results.json',
                   'server-process.json', 'playwright-process.json', 'run-summary.json']
+JSON_ALLOWLIST += ADMISSION_FILES
 LOG_ALLOWLIST = ['uvicorn.stdout', 'uvicorn.stderr', 'playwright.stdout', 'playwright.stderr']
 
 
@@ -200,9 +213,185 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+NETWORK_INSPECT_TIMEOUT = 15
+
+
 def output(argv):
-    return subprocess.check_output(argv, cwd=ROOT, stderr=subprocess.DEVNULL,
-                                   text=True, timeout=15).strip()
+    if argv[:1] != ['docker'] or argv[3:5] != ['network', 'inspect']:
+        return subprocess.check_output(argv, cwd=ROOT, stderr=subprocess.DEVNULL,
+                                       text=True, timeout=15).strip()
+    # One argv-only inspection, capped before allocation; no stderr capture.
+    process = subprocess.Popen(argv, cwd=ROOT, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    ready = threading.Event()
+    result = {}
+    def read():
+        try:
+            result['raw'] = process.stdout.read(65537)
+        except Exception as error:
+            result['error'] = error
+        finally:
+            ready.set()
+    reader = threading.Thread(target=read, daemon=True)
+    started = time.monotonic()
+    reader.start()
+    try:
+        if not ready.wait(NETWORK_INSPECT_TIMEOUT):
+            raise subprocess.TimeoutExpired(argv, NETWORK_INSPECT_TIMEOUT)
+        if 'error' in result:
+            raise result['error']
+        require(len(result['raw']) <= 65536, 'COMMAND_OUTPUT_SIZE')
+        code = process.wait(timeout=max(0.01, NETWORK_INSPECT_TIMEOUT - (time.monotonic() - started)))
+        if code:
+            raise subprocess.CalledProcessError(code, argv)
+        return result['raw'].decode('utf-8').strip()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        reader.join(timeout=1)
+        if not reader.is_alive():
+            process.stdout.close()
+
+
+def source_git(*args):
+    try:
+        return output(['git', '--no-replace-objects', *args])
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        raise Stop('SOURCE_GIT_COMMAND') from None
+
+
+def source_checkout():
+    head = source_git('rev-parse', '--verify', 'HEAD')
+    try:
+        event = admission.parse(Path(os.environ['GITHUB_EVENT_PATH']).read_bytes())
+    except (KeyError, OSError):
+        raise Stop('SOURCE_EVENT_FILE') from None
+    pr = admission.validate_execution_context(head, event, os.environ)
+    require(source_git('cat-file', '-t', head) == 'commit', 'SOURCE_HEAD_OBJECT_TYPE')
+    if pr is not None:
+        # Raw object headers retain parent order even in a shallow checkout.
+        headers = source_git('cat-file', 'commit', head).split('\n\n', 1)[0].splitlines()
+        parents = [line[7:] for line in headers if line.startswith('parent ')]
+        require(len(parents) == 2, 'SOURCE_MERGE_PARENT_COUNT')
+        require(parents == [pr['base']['sha'], pr['head']['sha']], 'SOURCE_MERGE_PARENT_ORDER')
+        for parent in parents:
+            admission.source_oid(parent)
+            require(source_git('cat-file', '-t', parent) == 'commit', 'SOURCE_PARENT_OBJECT_TYPE')
+    return head, pr
+
+
+def source_identity():
+    head, pr = source_checkout()
+    hashes = {n: digest(ROOT / n) for n in INPUTS}
+    value = {'checkout_sha': head, 'pr_head_sha': pr['head']['sha'] if pr else None,
+             'pr_base_sha': pr['base']['sha'] if pr else None,
+             'tested_merge_sha': head if pr else None,
+             'github_run_id': os.environ['GITHUB_RUN_ID'],
+             'github_run_attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'inputs': hashes,
+             'python_lock_sha256': hashes['uv.lock'],
+             'node_lock_sha256': hashes['quality/browser/package-lock.json']}
+    admission.validate_source(value, value)
+    return value
+
+
+def validate_launch(launch):
+    expected = source_identity()
+    admission.validate_source(launch['source_identity'], expected)
+    require(launch['head'] == expected['checkout_sha'] and launch['inputs'] == expected['inputs']
+            and launch['githubRun'] == expected['github_run_id']
+            and launch['githubAttempt'] == expected['github_run_attempt'], 'LAUNCH_SOURCE')
+    return expected
+
+
+def service_admission(path, source):
+    require(os.environ.get('RG06D_RUNNER_ENV') == 'github-hosted', 'HOSTED_RUNNER_REQUIRED')
+    require(not any(os.environ.get(k) for k in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH')), 'DOCKER_OVERRIDE')
+    reference = os.environ['RG06D_SERVICE_NETWORK']
+    admission.require(admission.classify_network_reference(reference) != 'REJECT', 'SERVICE_NETWORK')
+    context = output(['docker', 'context', 'show'])
+    endpoint = output(['docker', 'context', 'inspect', context, '--format', '{{.Endpoints.docker.Host}}'])
+    require(endpoint == 'unix:///var/run/docker.sock', 'JOB_DOCKER_ENDPOINT')
+    docker = ['docker', '--context', context]
+    engine = output(docker + ['info', '--format', '{{.ID}}'])
+    require(bool(engine), 'ENGINE_ID')
+    service_id = os.environ['RG06D_SERVICE_ID']
+    require(re.fullmatch('[a-f0-9]{64}', service_id), 'SERVICE_ID')
+    network_raw = output(docker + ['network', 'inspect', '--format',
+        '{"Id":{{json .Id}},"Name":{{json .Name}}}', reference]).encode('utf-8')
+    admission.require(0 < len(network_raw) <= 65536, 'SERVICE_NETWORK')
+    network = admission.validate_network(admission.parse(network_raw), reference)
+    fmt = ('{"Id":{{json .Id}},"Image":{{json .Image}},"State":{{json .State}},'
+           '"Mounts":{{json .Mounts}},"NetworkSettings":{{json .NetworkSettings}}}')
+    container = admission.parse(output(docker + ['inspect', service_id, '--format', fmt]).encode())
+    image = admission.parse(output(docker + ['image', 'inspect', IMAGE, '--format',
+        '{"Id":{{json .Id}},"Os":{{json .Os}},"Architecture":{{json .Architecture}},"RepoDigests":{{json .RepoDigests}}}']).encode())
+    require(IMAGE.split('@')[1] in [s.split('@')[-1] for s in image['RepoDigests']], 'SERVICE_IMAGE_DIGEST')
+    admission.validate_service(container, image, service_id, network['Id'], os.environ['RG06B_DB_PORT'], network['Name'])
+    address = next(iter(container['NetworkSettings']['Networks'].values()))['IPAddress']
+    # Loopback TCP inside the admitted container binds the cluster to this service;
+    # host-side connections independently validate the inspected bridge address.
+    query = 'SELECT row_to_json(i) FROM (' + admission.IDENTITY_SQL + ') i'
+    observed = admission.parse(output(docker + ['exec', '-e', 'PGPASSWORD=' + PASSWORD,
+        '-e', 'PGCONNECT_TIMEOUT=5', '-e', 'PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=5000', service_id,
+        'psql', '-X', '-w', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-U', 'reqguard_rg06b',
+        '-d', 'reqguard_rg06b', '-h', '127.0.0.1', '-c', query]).encode())
+    fingerprint = {k: observed[k] for k in admission.FINGERPRINT_KEYS}
+    admission.validate_identity(observed, fingerprint, {'address': '127.0.0.1', 'port': 5432})
+    value = {'schema_version': 'rg06d-service-v3', 'run_id': path.name,
+             'source_identity': source, 'container_id': service_id, 'engine_id': engine,
+             'endpoint': endpoint, 'image': IMAGE, 'image_id': image['Id'],
+             'network_reference': reference, 'network_name': network['Name'], 'network_id': network['Id'],
+             'attachment_network_name': next(iter(container['NetworkSettings']['Networks'])),
+             'attachment_network_id': next(iter(container['NetworkSettings']['Networks'].values()))['NetworkID'],
+             'host_port': os.environ['RG06B_DB_PORT'],
+             'fingerprint': fingerprint, 'service_observation': observed,
+             'host_path': {'address': address, 'port': 5432},
+             'host_target': {'host': '127.0.0.1', 'port': int(os.environ['RG06B_DB_PORT'])},
+             'published_bindings': container['NetworkSettings']['Ports']['5432/tcp']}
+    admission.validate_service_receipt(value, path.name, source, os.environ)
+    write(path / 'service-identity.json', value)
+    return value
+
+
+def unit_gate(path, source):
+    result = subprocess.run(['node', '--test', '--test-reporter', (PACKAGE / 'unit-reporter.mjs').as_uri(),
+                             'quality/browser/owned-cleanup.test.ts'], cwd=ROOT,
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=False)
+    value = {'schema_version': 'rg06d-unit-v1', 'run_id': path.name, 'source_identity': source,
+             'exit_code': result.returncode, 'report': admission.parse(result.stdout)}
+    write(path / 'ownership-unit.json', value)
+    admission.validate_unit(value, path.name, source)
+
+
+def preload_gate(path, source):
+    require(os.environ.get('RG06D_REQUIRE_PG_PRELOAD_TEST') == '1', 'PRELOAD_REQUIRED_MODE')
+    meta = PACKAGE / 'node_modules/pg/package.json'
+    require(meta.is_file(), 'PRELOAD_PG_MISSING')
+    version = admission.parse(meta.read_bytes())['version']
+    require(version == '8.23.1', 'PRELOAD_PG_VERSION')
+    result = subprocess.run(['node', '--test', '--test-reporter', (PACKAGE / 'unit-reporter.mjs').as_uri(),
+                             'quality/browser/ci-preload.integration.test.mjs'], cwd=ROOT,
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=False,
+                            env={**os.environ, 'RG06D_REQUIRE_PG_PRELOAD_TEST': '1'})
+    value = {'schema_version': 'rg06d-preload-v1', 'run_id': path.name, 'source_identity': source,
+             'exit_code': result.returncode, 'pg_version': version, 'report': admission.parse(result.stdout)}
+    write(path / 'pg-preload.json', value)
+    admission.validate_preload(value, path.name, source)
+
+
+def validate_admission_bundle(directory, source, run):
+    # Re-read bounded exact filenames at both execution and publication boundaries.
+    require({p.name for p in Path(directory).glob('ownership*.json')} ==
+            {'ownership.json', 'ownership-preservation.json', 'ownership-unit.json'}, 'OWNERSHIP_RECEIPT_SET')
+    raw = {n: admission.read(directory, n) for n in ADMISSION_FILES}
+    admission.validate_ownership(raw['ownership.json'], raw['ownership-preservation.json'], run, source)
+    admission.validate_unit(admission.parse(raw['ownership-unit.json']), run, source)
+    admission.validate_preload(admission.parse(raw['pg-preload.json']), run, source)
+    service = admission.parse(raw['service-identity.json'])
+    admission.validate_service_receipt(service, run, source, os.environ)
+    admission.validate_connections(admission.parse(raw['connections.json']), run, source, service['fingerprint'], service['host_path'])
+    return raw
 
 
 def artifact():
@@ -225,6 +414,7 @@ def prepare():
         'githubRun': os.environ['GITHUB_RUN_ID'], 'githubAttempt': os.environ['GITHUB_RUN_ATTEMPT'],
         'postgresImage': IMAGE, 'inputs': {n: digest(ROOT / n) for n in INPUTS},
         'serviceDisposal': 'GITHUB_MANAGED_NOT_ATTESTED_BY_HARNESS',
+        'source_identity': source_identity(),
     })
     with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
         stream.write(f'RG06B_RUN_ID={run}\nRG06B_ARTIFACT={path}\n')
@@ -264,15 +454,105 @@ def no_descendants(summary):
     summary['descendantsExited'] = False
 
 
+class RuntimeFailure:
+    """Small stage cursor; failure diagnostics never confer acceptance."""
+    def __init__(self, path):
+        self.path = path
+        self.source = None
+        self.index = 0
+        self.first = None
+        self._source_bytes = None
+        self._first_bytes = None
+        self._persisted = False
+        self._initial_attempted = False
+        self._cleanup = 'PENDING'
+
+    def completed(self, stage):
+        require(self.first is None and admission.DIAGNOSTIC_STAGES[self.index] == stage,
+                'DIAGNOSTIC_TRANSITION')
+        self.index += 1
+
+    def save(self):
+        try:
+            source = json.loads(self._source_bytes)
+            value = json.loads(self._first_bytes)
+            value['cleanup_status'] = self._cleanup
+            raw = (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode('ascii')
+            if not self._persisted:
+                admission.require(not self._initial_attempted, 'DIAGNOSTIC_INITIAL_UNAVAILABLE')
+                self._initial_attempted = True
+                identity = admission.begin_capture(self.path)
+                admission.atomic_failure(self.path, raw, self.path.name, source)
+                admission.confirm_capture(self.path, identity, raw, self.path.name, source)
+                self._persisted = True
+            else:
+                admission.require(not admission.capture_denied(self.path), 'DIAGNOSTIC_CAPTURE_DENIED')
+                admission.atomic_failure(self.path, raw, self.path.name, source)
+        except Exception:
+            print('DIAGNOSTIC_UNAVAILABLE')
+
+    def failed(self, error):
+        if self.first is not None:
+            return
+        # Latch before classification/I/O. Capture failure cannot be recaptured later.
+        self.first = MappingProxyType({})
+        try:
+            stage = admission.DIAGNOSTIC_STAGES[self.index]
+            source = json.loads(json.dumps(self.source, allow_nan=False))
+            identity, reference = admission.diagnostic_binding(self.path.name, source)
+            code, original, site = admission.attribute_first_error(
+                error, stage, source, FIRST_ERROR_RUNNER_CODES, Stop)
+            value = {'last_completed_runtime_stage': admission.DIAGNOSTIC_STAGES[self.index - 1]
+                     if self.index else 'NONE', 'first_failed_runtime_stage': stage,
+                     'allowlisted_failure_code': code, 'cleanup_status': 'PENDING',
+                     'schema_version': 'rg06d-failure-diagnostic-v2',
+                     'run_identity': identity, 'source_identity_reference': reference,
+                     'first_admission_error_code': original, 'first_admission_call_site': site}
+            self._source_bytes = json.dumps(source, sort_keys=True, allow_nan=False).encode('ascii')
+            self._first_bytes = json.dumps(value, sort_keys=True, allow_nan=False).encode('ascii')
+            self.first = MappingProxyType({k: v for k, v in value.items()
+                                           if k not in ('run_identity', 'source_identity_reference')})
+            self.save()
+        except Exception:
+            print('DIAGNOSTIC_UNAVAILABLE')
+
+    def cleanup(self, server_receipt, test_receipt, summary, raised):
+        if self.first is None or not self._persisted or self._cleanup != 'PENDING':
+            return
+        complete = (not raised and summary.get('descendantsExited') is True
+                    and all(not r['started'] or (r['exited'] and not r['forced']
+                            and not r.get('terminationUnknown')) for r in (server_receipt, test_receipt))
+                    and (not server_receipt['started'] or server_receipt.get('gracefulShutdown') is True))
+        self._cleanup = 'COMPLETED' if complete else 'FAILED_OR_UNVERIFIED'
+        self.save()
+
+
+@contextmanager
+def diagnostic_cleanup(tracker, server_receipt, test_receipt, summary):
+    try:
+        yield
+    except BaseException as error:
+        tracker.failed(error)
+        raise
+    finally:
+        tracker.cleanup(server_receipt, test_receipt, summary, sys.exc_info()[0] is not None)
+
+
 def run_tests():
-    path = artifact()
+    try:
+        path = artifact()
+    except Exception:
+        print('DIAGNOSTIC_UNAVAILABLE')
+        raise
     server = playwright = None
     server_receipt = {'started': False, 'exited': False, 'forced': False}
     test_receipt = {'started': False, 'exited': False, 'forced': False}
     summary = {'state': 'FAIL', 'run': path.name, 'sqlCleanup': 'NOT_VERIFIED',
                'serviceDisposal': 'GITHUB_MANAGED_NOT_ATTESTED_BY_HARNESS'}
     streams = []
+    failure = RuntimeFailure(path)
     try:
+        failure.source = source_identity()
         require(sys.platform == 'linux' and sys.version_info[:3] == (3, 12, 10)
                 and os.environ.get('GITHUB_ACTIONS') == 'true', 'LINUX_PYTHON_VERSION')
         prctl = ctypes.CDLL(None, use_errno=True).prctl
@@ -281,8 +561,15 @@ def run_tests():
         require(output(['node', '--version']) == 'v24.15.0', 'NODE_VERSION')
         require(output(['npm', '--version']) == '11.12.1', 'NPM_VERSION')
         require(output(['uv', 'self', 'version', '--short']) == '0.11.22', 'UV_VERSION')
-        launch = json.loads((path / 'launch.json').read_text())
+        failure.completed('EARLY_CHECKS')
+        launch = admission.parse(admission.read(path, 'launch.json'))
+        source = validate_launch(launch)
         require(all(digest(ROOT / n) == h for n, h in launch['inputs'].items()), 'SOURCE_OR_LOCK_CHANGED')
+        failure.completed('SOURCE_INTEGRITY')
+        unit_gate(path, source)
+        failure.completed('OWNERSHIP_UNIT')
+        preload_gate(path, source)
+        failure.completed('PG_PRELOAD')
         locked = {p['name']: p['version'] for p in tomllib.loads((ROOT / 'uv.lock').read_text())['package']}
         runtime = {n: importlib.metadata.version(n) for n in
                    ('fastapi', 'psycopg', 'psycopg-binary', 'uvicorn', 'pydantic', 'starlette')}
@@ -299,13 +586,18 @@ def run_tests():
         cache = Path(os.environ['PLAYWRIGHT_BROWSERS_PATH']).resolve(strict=True)
         require(browser.is_file() and browser.resolve().is_relative_to(cache)
                 and 'chromium-1248' in browser.parts, 'CHROMIUM_BOUNDARY')
+        failure.completed('RUNTIME_PACKAGES')
         port = os.environ['RG06B_DB_PORT']
         require(port.isdigit() and 1024 <= int(port) <= 65535, 'DB_PORT')
         require(os.environ['RG06D_DB_PASSWORD'] == PASSWORD, 'CI_SERVICE_CREDENTIAL')
         dsn = f'postgresql://reqguard_rg06b:{PASSWORD}@127.0.0.1:{port}/reqguard_rg06b'
+        service = service_admission(path, source)
         import psycopg
         # One bounded, independent connection. No fallback to an existing DB.
         with psycopg.connect(dsn, connect_timeout=5, options='-c statement_timeout=5000') as connection:
+            admission.validate_client_target(connection.info.host, connection.info.port, service['host_target'])
+            actual = admission.observe(connection)
+            admission.validate_identity(actual, service['fingerprint'], service['host_path'])
             identity = connection.execute("SELECT current_database(), current_user, current_setting('server_version_num')").fetchone()
             require(identity == ('reqguard_rg06b', 'reqguard_rg06b', '170011'), 'DB_IDENTITY')
             require(connection.execute("SELECT to_regclass('public.analyses')").fetchone() == (None,), 'DB_NOT_FRESH')
@@ -315,6 +607,7 @@ def run_tests():
         write(path / 'postgres-ready.json', {'database': identity[0], 'role': identity[1],
               'serverVersionNum': identity[2], 'freshSchemaCommitted': True,
               'pythonPackages': runtime, 'chromiumSha256': digest(browser)})
+        failure.completed('POSTGRESQL_ADMISSION')
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             api_port = sock.getsockname()[1]
@@ -322,11 +615,12 @@ def run_tests():
         env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
         env.update(DATABASE_URL=dsn, RG06B_PASSWORD=PASSWORD, RG06B_API_PORT=str(api_port),
                    RG06B_BASE_URL=f'http://127.0.0.1:{api_port}', PYTHONDONTWRITEBYTECODE='1')
+        admission.validate_source_domain(source)
+        env['RG06D_EXPECTED_SOURCE_IDENTITY_SHA256'] = admission.diagnostic_binding(path.name, source)[1]['source_identity_sha256']
         # These child-only values fulfill the existing RG-06B config/spec contract.
         for name in ('uvicorn.stdout', 'uvicorn.stderr', 'playwright.stdout', 'playwright.stderr'):
             streams.append((path / name).open('xb'))
-        server = subprocess.Popen([sys.executable, '-B', '-m', 'uvicorn', 'reqguard.main:app',
-                                   '--host', '127.0.0.1', '--port', str(api_port), '--workers', '1'],
+        server = subprocess.Popen([sys.executable, '-B', str(ROOT / 'scripts/rg06d_admission.py')],
                                   cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                                   stdout=streams[0], stderr=streams[1], start_new_session=True)
         server_receipt.update(started=True, pid=server.pid, startedAt=time.time())
@@ -345,6 +639,9 @@ def run_tests():
             time.sleep(0.1)
         require(ready and server.poll() is None, 'SERVER_READINESS_TIMEOUT')
         server_receipt['ready'] = True
+        require(not env.get('NODE_OPTIONS'), 'AMBIENT_NODE_OPTIONS')
+        env.update(RG06D_NODE_IDENTITY='1', NODE_OPTIONS='--import=' + (PACKAGE / 'ci-identity.mjs').as_uri())
+        failure.completed('API_SERVER')
         playwright = subprocess.Popen(['node', str(PACKAGE / 'node_modules/playwright/cli.js'),
                                        'test', '--config', str(PACKAGE / 'playwright.ci.config.ts'),
                                        '--project=chromium'], cwd=ROOT, env=env,
@@ -372,39 +669,76 @@ def run_tests():
                 and s['tests'][0]['projectName'] == 'chromium' and s['tests'][0]['status'] == 'expected'
                 and len(s['tests'][0]['results']) == 1 and s['tests'][0]['results'][0]['status'] == 'passed'
                 and s['tests'][0]['results'][0]['retry'] == 0 for s in specs), 'EXACT_THREE_RESULTS')
+        failure.completed('CHROMIUM')
         validate_unsupported_receipts(read_unsupported_receipts(path), path.name)
+        connections = [admission.parse(admission.read(path, p.name)) for p in sorted(path.glob('connection-*.json'))]
+        write(path / 'connections.json', {'schema_version': 'rg06d-connections-v1', 'run_id': path.name,
+                                         'source_identity': source, 'connections': connections})
+        validate_launch(admission.parse(admission.read(path, 'launch.json')))
+        validate_admission_bundle(path, source, path.name)
         summary.update(tests=report['stats'], sqlCleanup='VERIFIED', assertions='PASS')
+        failure.completed('EVIDENCE_VALIDATION')
     except BaseException as error:
-        summary['reason'] = str(error) if isinstance(error, Stop) else 'EXECUTION_' + type(error).__name__
+        failure.failed(error)
+        # Only bounded classification, never dynamic exception text/class names.
+        summary['reason'] = (failure.first.get('allowlisted_failure_code', 'EXECUTION_EXCEPTION')
+                             if failure.first is not None else 'EXECUTION_EXCEPTION')
     finally:
-        for process, receipt in [(playwright, test_receipt), (server, server_receipt)]:
-            try:
-                stop_process(process, receipt)
-            except BaseException:
-                receipt['terminationUnknown'] = True
-        if server is not None:
-            server_receipt['finishedAt'] = time.time()
-        no_descendants(summary)
-        for stream in streams:
-            stream.close()
-        # Uvicorn re-raises a handled SIGTERM after graceful lifespan shutdown.
-        server_log = (path / 'uvicorn.stderr').read_text(errors='replace') if streams else ''
-        server_receipt['gracefulShutdown'] = (
-            server_receipt.get('terminationRequested') is True
-            and server_receipt.get('exit') in (0, -signal.SIGTERM)
-            and 'Application shutdown complete.' in server_log
-            and 'Finished server process' in server_log)
-        clean = (summary.get('assertions') == 'PASS' and server_receipt['gracefulShutdown']
-                 and all(r['exited'] and not r['forced'] and not r.get('terminationUnknown')
-                         for r in (server_receipt, test_receipt)) and summary['descendantsExited'])
-        summary['state'] = 'PASS' if clean else 'FAIL'
-        if not clean:
-            summary.setdefault('reason', 'PROCESS_CLEANUP_NOT_VERIFIED')
-        write(path / 'server-process.json', server_receipt)
-        write(path / 'playwright-process.json', test_receipt)
-        write(path / 'run-summary.json', summary)
+        with diagnostic_cleanup(failure, server_receipt, test_receipt, summary):
+            for process, receipt in [(playwright, test_receipt), (server, server_receipt)]:
+                try:
+                    stop_process(process, receipt)
+                except BaseException:
+                    receipt['terminationUnknown'] = True
+            if server is not None:
+                server_receipt['finishedAt'] = time.time()
+            no_descendants(summary)
+            for stream in streams:
+                stream.close()
+            # Uvicorn re-raises a handled SIGTERM after graceful lifespan shutdown.
+            server_log = (path / 'uvicorn.stderr').read_text(errors='replace') if streams else ''
+            server_receipt['gracefulShutdown'] = (
+                server_receipt.get('terminationRequested') is True
+                and server_receipt.get('exit') in (0, -signal.SIGTERM)
+                and 'Application shutdown complete.' in server_log
+                and 'Finished server process' in server_log)
+            clean = (summary.get('assertions') == 'PASS' and server_receipt['gracefulShutdown']
+                     and all(r['exited'] and not r['forced'] and not r.get('terminationUnknown')
+                             for r in (server_receipt, test_receipt)) and summary['descendantsExited'])
+            summary['state'] = 'PASS' if clean else 'FAIL'
+            if not clean:
+                failure.failed(Stop('PROCESS_CLEANUP_NOT_VERIFIED'))
+                summary.setdefault('reason', 'PROCESS_CLEANUP_NOT_VERIFIED')
+            write(path / 'server-process.json', server_receipt)
+            write(path / 'playwright-process.json', test_receipt)
+            write(path / 'run-summary.json', summary)
     print('RG06D ' + summary['state'] + '; run=' + path.name)
     return 0 if summary['state'] == 'PASS' else 1
+
+
+def publish_failure(raw, safe, publication):
+    """Independent source-bound diagnostic path, never part of copied acceptance."""
+    target = safe / admission.DIAGNOSTIC_NAME
+    try:
+        require(publication['runOutcome'] == 'failure', 'DIAGNOSTIC_CONTEXT')
+        require(raw.name == os.environ['RG06B_RUN_ID'], 'DIAGNOSTIC_EXECUTION_CONTEXT')
+        require(not admission.capture_denied(raw), 'DIAGNOSTIC_CAPTURE_DENIED')
+        directory_identity = admission.capture_directory(raw)
+        source = source_identity()
+        require(source['github_run_id'] == os.environ['GITHUB_RUN_ID']
+                and source['github_run_attempt'] == os.environ['GITHUB_RUN_ATTEMPT'], 'DIAGNOSTIC_CI_CONTEXT')
+        original = admission.read_failure(raw, raw.name, source)
+        admission.atomic_failure(safe, original, raw.name, source)
+        require(admission.read_failure(safe, raw.name, source) == original, 'DIAGNOSTIC_COPY_CHANGED')
+        require(admission.read_failure(raw, raw.name, source) == original, 'DIAGNOSTIC_RAW_CHANGED')
+        require(admission.capture_directory(raw) == directory_identity
+                and not admission.capture_denied(raw), 'DIAGNOSTIC_CAPTURE_CHANGED')
+        publication['diagnosticPublication'] = 'PUBLISHED'
+    except Exception:
+        # safe is newly created; remove only this diagnostic copy, never raw files.
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        publication['diagnosticPublication'] = 'DIAGNOSTIC_UNAVAILABLE'
 
 
 def publish():
@@ -417,11 +751,16 @@ def publish():
                    'dependencyOutcome': os.environ.get('RG06D_DEPENDENCY_OUTCOME', 'unknown'),
                    'serviceDisposal': 'GITHUB_MANAGED_NOT_ATTESTED_BY_HARNESS',
                    'copied': [], 'rejected': [], 'binaryDiagnostics': 'NOT_PUBLISHED',
+                   'diagnosticPublication': 'DIAGNOSTIC_UNAVAILABLE',
                    'note': 'Only allowlisted JSON and redacted text; no profiles, temp, traces or screenshots.'}
     # Write safe fallback evidence even if setup never reached the harness.
     write(safe / 'publication-context.json', publication)
     try:
         raw = artifact()
+        if publication['runOutcome'] == 'failure':
+            publish_failure(raw, safe, publication)
+        source = validate_launch(admission.parse(admission.read(raw, 'launch.json')))
+        admission_bytes = validate_admission_bundle(raw, source, raw.name)
         receipt_bytes = {}
         receipt_valid = False
         try:
@@ -437,7 +776,10 @@ def publish():
             try:
                 require(source.is_file() and not source.is_symlink() and source.stat().st_size <= 10_000_000,
                         'UNSAFE_ARTIFACT_FILE')
-                if name in UNSUPPORTED_EVIDENCE_FILES:
+                if name in ADMISSION_FILES:
+                    require(source.read_bytes() == admission_bytes[name], 'ADMISSION_EVIDENCE_CHANGED')
+                    text = admission_bytes[name].decode('utf-8')
+                elif name in UNSUPPORTED_EVIDENCE_FILES:
                     require(receipt_valid, 'UNSUPPORTED_EVIDENCE_INVALID')
                     require(source.read_bytes() == receipt_bytes[name], 'EVIDENCE_CHANGED')
                     text = receipt_bytes[name].decode('utf-8')
@@ -453,8 +795,9 @@ def publish():
                                       r'https?://[^\s/:]+:[^\s@]+@', text), 'SENSITIVE_ARTIFACT')
                 if name in JSON_ALLOWLIST:
                     json.loads(text)
-                if name in UNSUPPORTED_EVIDENCE_FILES:
-                    require(text.encode('utf-8') == receipt_bytes[name], 'EVIDENCE_REDACTION_CHANGED')
+                if name in UNSUPPORTED_EVIDENCE_FILES or name in ADMISSION_FILES:
+                    expected_bytes = admission_bytes[name] if name in ADMISSION_FILES else receipt_bytes[name]
+                    require(text.encode('utf-8') == expected_bytes, 'EVIDENCE_REDACTION_CHANGED')
                 (safe / name).write_text(text, encoding='utf-8')
                 publication['copied'].append(name)
             except (OSError, ValueError, Stop):
@@ -463,8 +806,10 @@ def publish():
             # Revalidate the copied bytes, not a previous run-success flag.
             validate_unsupported_receipts(read_unsupported_receipts(safe), os.environ['RG06B_RUN_ID'])
             require(read_unsupported_receipts(raw) == receipt_bytes, 'EVIDENCE_CHANGED')
+            validate_admission_bundle(safe, validate_launch(admission.parse(admission.read(safe, 'launch.json'))), raw.name)
+            require({n: admission.read(raw, n) for n in ADMISSION_FILES} == admission_bytes, 'ADMISSION_EVIDENCE_CHANGED')
             # No lock spans this check and upload; later filesystem races remain possible.
-    except (KeyError, OSError, ValueError, Stop):
+    except (KeyError, OSError, ValueError, Stop, admission.AdmissionError):
         publication['rejected'].append('RAW_EVIDENCE_UNAVAILABLE')
     if publication['runOutcome'] == 'success':
         publication['rejected'].extend('MISSING_' + name for name in JSON_ALLOWLIST + LOG_ALLOWLIST
@@ -474,6 +819,11 @@ def publish():
     write(safe / 'publication-manifest.json', publication)
     require(publication['copied'] and not publication['rejected'], 'EVIDENCE_PUBLICATION_INCOMPLETE')
     print('RG06D safe evidence prepared')
+
+
+
+
+FIRST_ERROR_RUNNER_CODES = tuple(('C', f.__code__) for f in (require, service_admission, run_tests))
 
 
 if __name__ == '__main__':

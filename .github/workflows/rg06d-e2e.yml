@@ -36,6 +36,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Source admission verifies the tested merge and both parent objects.
+          fetch-depth: 2
       - name: Prepare evidence before dependency setup
         run: |
           printf 'PLAYWRIGHT_BROWSERS_PATH=%s/rg06d-browsers\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
@@ -59,10 +61,18 @@ jobs:
           node -e "const b=require('./quality/browser/node_modules/playwright-core/browsers.json').browsers.find(b=>b.name==='chromium'); if(b.revision!=='1248') process.exit(1)"
           node quality/browser/node_modules/playwright/cli.js install --with-deps --no-shell chromium
           git diff --exit-code -- pyproject.toml uv.lock quality/browser/package.json quality/browser/package-lock.json
-      - name: Run isolated CI harness once
+      - name: Check deterministic admission components
+        run: |
+          python3 -B -m unittest discover -s scripts -p test_rg06d_admission.py -v
+          node --test quality/browser/ci-identity.test.mjs quality/browser/ci-preload-gate.test.mjs
+      - name: Run required preload, four-unit gate and isolated CI harness once
         id: e2e
         timeout-minutes: 5
         env:
+          RG06D_REQUIRE_PG_PRELOAD_TEST: '1'
+          RG06D_RUNNER_ENV: ${{ runner.environment }}
+          RG06D_SERVICE_ID: ${{ job.services.postgres.id }}
+          RG06D_SERVICE_NETWORK: ${{ job.services.postgres.network }}
           RG06B_DB_PORT: ${{ job.services.postgres.ports[5432] }}
           RG06D_DB_PASSWORD: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
           UV_OFFLINE: '1'
@@ -73,6 +83,9 @@ jobs:
         id: publish
         if: ${{ always() }}
         env:
+          RG06D_SERVICE_ID: ${{ job.services.postgres.id }}
+          RG06D_SERVICE_NETWORK: ${{ job.services.postgres.network }}
+          RG06B_DB_PORT: ${{ job.services.postgres.ports[5432] }}
           RG06D_RUN_OUTCOME: ${{ steps.e2e.outcome }}
           RG06D_DEPENDENCY_OUTCOME: ${{ steps.dependencies.outcome }}
         run: python3 -B scripts/run_rg06d_ci.py publish
