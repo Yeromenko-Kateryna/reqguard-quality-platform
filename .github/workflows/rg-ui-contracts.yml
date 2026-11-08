@@ -1,0 +1,293 @@
+name: RG-UI Frontend Contract Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '24.15.0'
+          package-manager-cache: false
+      - name: Execute the existing frontend contracts once
+        id: frontend
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          node --version > "$RUNNER_TEMP/ui-contracts-node-version.txt"
+          test "$(cat "$RUNNER_TEMP/ui-contracts-node-version.txt")" = v24.15.0
+          set +e
+          node --test \
+            --test-reporter=junit \
+            --test-reporter-destination="$RUNNER_TEMP/ui-contracts.xml" \
+            tests/ui.test.mjs \
+            > "$RUNNER_TEMP/ui-contracts.stdout.log" \
+            2> "$RUNNER_TEMP/ui-contracts.stderr.log"
+          test_exit=$?
+          set -e
+          printf '%s\n' "$test_exit" > "$RUNNER_TEMP/ui-contracts.exit"
+          exit "$test_exit"
+      - name: Validate exact identities and complete successful outcomes
+        id: validation
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 -B - "$RUNNER_TEMP/ui-contracts.xml" "$RUNNER_TEMP/ui-contracts.exit" "$RUNNER_TEMP/ui-contracts-validation.json" <<'PY'
+          import collections
+          import hashlib
+          import json
+          import math
+          from pathlib import Path
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # Independent source-level contract; never inferred from report contents.
+          EXPECTED = [
+              'POST uses the same-origin JSON API and preserves the original text',
+              'unsupported_fixture remains a distinct valid result without analysis',
+              '422 preserves readable validation details without emitting success',
+              'HTTP 503 never produces a successful result or retries',
+              'HTTP 500 never produces a successful result or retries',
+              'network failure reports an uncertain outcome and performs no retry',
+              'unreadable successful response is not misreported as a network error or success',
+              'malformed analysis is rejected before DOM rendering',
+              'rendered results use text nodes for every API field, including markup',
+              'loading disables duplicate submission and hides the previous result; 422 clears success',
+              'unsupported result replaces completed analysis instead of retaining stale content',
+          ]
+          report, exit_path, receipt_path = map(Path, sys.argv[1:])
+          result = {
+              'schema': 'rg-ui-contracts-validation-v1',
+              'expected_count': 11, 'actual_count': 0,
+              'expected_identities': sorted(EXPECTED), 'actual_identities': [],
+              'duplicates': [], 'missing': sorted(EXPECTED), 'unexpected': [],
+              'outcomes': {'failure': 0, 'error': 0, 'skipped': 0, 'todo_or_cancelled': 0},
+              'testcases': [], 'test_exit_code': None, 'junit_sha256': None,
+              'findings': [], 'result': 'FAIL',
+          }
+
+          def check(condition, reason):
+              if not condition and reason not in result['findings']:
+                  result['findings'].append(reason)
+
+          def duration(value):
+              try:
+                  return value is not None and math.isfinite(float(value)) and float(value) >= 0
+              except (ValueError, TypeError):
+                  return False
+
+          try:
+              raw_exit = exit_path.read_bytes()
+              check(len(raw_exit) <= 32 and re.fullmatch(rb'(0|[1-9][0-9]*)\n?', raw_exit) is not None,
+                    'TEST_EXIT_FORMAT')
+              if 'TEST_EXIT_FORMAT' not in result['findings']:
+                  result['test_exit_code'] = int(raw_exit)
+          except OSError:
+              check(False, 'TEST_EXIT_MISSING')
+          check(result['test_exit_code'] == 0, 'TEST_EXIT_NONZERO_OR_UNKNOWN')
+
+          try:
+              check(report.is_file(), 'REPORT_MISSING')
+              if not report.is_file():
+                  raise ValueError('REPORT_MISSING')
+              check(0 < report.stat().st_size <= 262144, 'REPORT_SIZE')
+              if 'REPORT_SIZE' in result['findings']:
+                  raise ValueError('REPORT_SIZE')
+              raw = report.read_bytes()
+              result['junit_sha256'] = hashlib.sha256(raw).hexdigest()
+              check(b'<!DOCTYPE' not in raw and b'<!ENTITY' not in raw, 'XML_DECLARATION_FORBIDDEN')
+              if 'XML_DECLARATION_FORBIDDEN' in result['findings']:
+                  raise ValueError('XML_DECLARATION_FORBIDDEN')
+              parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+              root = ET.fromstring(raw, parser=parser)
+              cases = list(root.iter('testcase'))
+              result['actual_count'] = len(cases)
+              check(len(cases) <= 64, 'CASE_LIMIT')
+              if len(cases) > 64:
+                  raise ValueError('CASE_LIMIT')
+              names = [case.get('name', '') for case in cases]
+              check(all(0 < len(name) <= 512 for name in names), 'IDENTITY_LENGTH')
+              result['actual_identities'] = sorted(name[:512] for name in names)
+              counts = collections.Counter(names)
+              result['duplicates'] = sorted(name[:512] for name, count in counts.items() if count > 1)
+              result['missing'] = sorted(set(EXPECTED) - set(names))
+              result['unexpected'] = sorted(name[:512] for name in set(names) - set(EXPECTED))
+              for key in ('failure', 'error', 'skipped'):
+                  result['outcomes'][key] = len(list(root.iter(key)))
+              result['outcomes']['todo_or_cancelled'] = sum(
+                  1 for node in root.iter()
+                  if node.tag in ('todo', 'cancelled', 'canceled')
+                  or any(word in str(value).lower()
+                         for key, value in node.attrib.items()
+                         if key in ('type', 'status', 'todo', 'cancelled', 'canceled')
+                         for word in ('todo', 'cancel', 'pending'))
+              )
+              # Observed Node 24.15.0 output: direct cases, no testsuite wrapper;
+              # aggregate outcomes are XML comments and MUST NOT be discarded.
+              check(root.tag == 'testsuites' and not root.attrib, 'ROOT_STRUCTURE')
+              check(len(root) == 19 and all(child.tag in ('testcase', ET.Comment) for child in root),
+                    'ROOT_CHILDREN')
+              check(not list(root.iter('testsuite')), 'UNEXPECTED_SUITE_WRAPPER')
+              check(not (root.text or '').strip()
+                    and all(not (child.tail or '').strip() for child in root), 'UNEXPECTED_TEXT')
+              summary = {}
+              for child in root:
+                  if child.tag is ET.Comment:
+                      match = re.fullmatch(r' (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ([^ ]+) ',
+                                           child.text or '')
+                      check(match is not None, 'SUMMARY_FORMAT')
+                      if match:
+                          key, value = match.groups()
+                          check(key not in summary, 'DUPLICATE_SUMMARY')
+                          summary[key] = value
+              result['summary'] = summary
+              check(set(summary) == {'tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo', 'duration_ms'},
+                    'SUMMARY_KEYS')
+              for key, expected in {'tests': 11, 'suites': 0, 'pass': 11, 'fail': 0,
+                                    'cancelled': 0, 'skipped': 0, 'todo': 0}.items():
+                  value = summary.get(key, '')
+                  check(re.fullmatch(r'0|[1-9][0-9]*', value) is not None
+                        and int(value) == expected, 'SUMMARY_COUNTER_' + key.upper())
+              check(duration(summary.get('duration_ms')), 'SUMMARY_DURATION')
+              if any(summary.get(key) not in (None, '0') for key in ('todo', 'cancelled')):
+                  result['outcomes']['todo_or_cancelled'] += 1
+              check(len(cases) == 11, 'TESTCASE_COUNT')
+              check(not result['duplicates'], 'DUPLICATE_IDENTITY')
+              check(not result['missing'] and not result['unexpected'], 'IDENTITY_SET')
+              check(not any(result['outcomes'].values()), 'NONPASS_OUTCOME')
+              for case in cases:
+                  check(set(case.attrib) == {'name', 'classname', 'time', 'file'}, 'TESTCASE_ATTRIBUTES')
+                  check(case.get('classname') == 'test', 'TESTCASE_CLASS')
+                  check(case.get('file') == str(Path('tests/ui.test.mjs').resolve()), 'TESTCASE_FILE')
+                  check(duration(case.get('time')), 'TESTCASE_TIME')
+                  check(len(case) == 0 and not (case.text or '').strip(), 'TESTCASE_NOT_PLAIN_PASS')
+                  result['testcases'].append({
+                      'name': case.get('name', '')[:512],
+                      'outcome': 'PASS' if len(case) == 0 else 'NONPASS',
+                  })
+          except ET.ParseError:
+              check(False, 'XML_MALFORMED')
+          except OSError:
+              check(False, 'REPORT_READ_ERROR')
+          except ValueError:
+              check(False, 'REPORT_REJECTED')
+          result['result'] = 'FAIL' if result['findings'] else 'PASS'
+          receipt_path.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps(result, sort_keys=True))
+          sys.exit(0 if result['result'] == 'PASS' else 1)
+          PY
+      - name: Prepare bounded source and execution evidence
+        id: evidence
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          files = ['.github/workflows/rg-ui-contracts.yml', 'tests/ui.test.mjs', 'reqguard/static/app.mjs']
+          sources = {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in files}
+          head = subprocess.run(['git', 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+          command = ['node', '--test', '--test-reporter=junit',
+                     '--test-reporter-destination=' + str(temp / 'ui-contracts.xml'), 'tests/ui.test.mjs']
+          names = ['ui-contracts.xml', 'ui-contracts.exit', 'ui-contracts-node-version.txt',
+                   'ui-contracts.stdout.log', 'ui-contracts.stderr.log', 'ui-contracts-validation.json']
+          evidence = {'schema': 'rg-ui-contracts-evidence-v1', 'commit': head, 'sources_sha256': sources,
+                      'test_command': command, 'files': {}, 'missing': [],
+                      'artifact_upload': 'Recorded after upload in final job summary; not yet available'}
+          for name in names:
+              path = temp / name
+              if path.is_file():
+                  raw = path.read_bytes()
+                  evidence['files'][name] = {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+              else:
+                  evidence['missing'].append(name)
+          version = temp / 'ui-contracts-node-version.txt'
+          code = temp / 'ui-contracts.exit'
+          evidence['node_version'] = version.read_text().strip() if version.is_file() else None
+          evidence['test_exit_code'] = code.read_text().strip() if code.is_file() else None
+          (temp / 'ui-contracts-evidence.json').write_text(json.dumps(evidence, indent=2) + '\n', encoding='utf-8')
+          PY
+      - name: Upload frontend diagnostics even after failure
+        id: upload
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: rg-ui-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ui-contracts.xml
+            ${{ runner.temp }}/ui-contracts.exit
+            ${{ runner.temp }}/ui-contracts-node-version.txt
+            ${{ runner.temp }}/ui-contracts.stdout.log
+            ${{ runner.temp }}/ui-contracts.stderr.log
+            ${{ runner.temp }}/ui-contracts-validation.json
+            ${{ runner.temp }}/ui-contracts-evidence.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+      - name: Require execution, validation, evidence and artifact publication
+        id: gate
+        if: ${{ always() }}
+        env:
+          TEST_OUTCOME: ${{ steps.frontend.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          RUN_CANCELLED: ${{ job.status == 'cancelled' }}
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          receipt = {name: os.environ.get(name, '') for name in (
+              'TEST_OUTCOME', 'VALIDATION_OUTCOME', 'EVIDENCE_OUTCOME',
+              'UPLOAD_OUTCOME', 'ARTIFACT_ID', 'RUN_CANCELLED')}
+          passed = all(receipt[name] == 'success' for name in (
+              'TEST_OUTCOME', 'VALIDATION_OUTCOME', 'EVIDENCE_OUTCOME', 'UPLOAD_OUTCOME'))
+          passed = passed and bool(receipt['ARTIFACT_ID']) and receipt['RUN_CANCELLED'] == 'false'
+          try:
+              validation = json.loads((temp / 'ui-contracts-validation.json').read_text())
+              evidence = json.loads((temp / 'ui-contracts-evidence.json').read_text())
+              code = (temp / 'ui-contracts.exit').read_text()
+              passed = (passed and code == '0\n' and validation['result'] == 'PASS'
+                        and validation['test_exit_code'] == 0 and evidence['missing'] == []
+                        and evidence['node_version'] == 'v24.15.0' and evidence['test_exit_code'] == '0')
+          except (OSError, ValueError, KeyError, TypeError):
+              passed = False
+          receipt['FINAL_GATE'] = 'PASS' if passed else 'FAIL'
+          print(json.dumps(receipt, sort_keys=True))
+          # Upload outputs exist only after upload: retain them in the job summary.
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('### Frontend contract final gate\n\n```json\n'
+                            + json.dumps(receipt, indent=2) + '\n```\n')
+          sys.exit(0 if passed else 1)
+          PY
