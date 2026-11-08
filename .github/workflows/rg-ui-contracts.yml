@@ -258,7 +258,7 @@ jobs:
           EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
           UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
           ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
-          RUN_CANCELLED: ${{ cancelled() }}
+          RUN_CANCELLED: ${{ job.status == 'cancelled' }}
         run: |
           set -euo pipefail
           python3 -B - <<'PY'
