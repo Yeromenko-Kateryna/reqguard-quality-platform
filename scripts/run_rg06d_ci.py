@@ -421,6 +421,190 @@ def prepare():
     print('RG06D PREPARED; no tests executed')
 
 
+# PREPARE-only proposal: fixed source-bound diagnostic vocabulary; never acceptance.
+PREPARE_DIAGNOSTIC_ADMISSION_SHA256 = '9f126fcccb4949b04534a3ae5e02eca9bf3c9247984683071004b60266b6be18'
+PREPARE_DIAGNOSTIC_FUNCTIONS = (
+    ('A', 'require', '2c87fcb719ea6926e19c5f0aa7181d237f4bc16a2cfca703c00c51a9771d0cb1'),
+    ('A', 'shape', '591fccfd5ae5148362f020ebf2eea35be0cdd6c1200f70dc055d760a409fe319'),
+    ('A', 'parse', '231ee7d9a47e3a56ded5945cef152759c6c3e14e7369b160fa0c3b9b5d7dd895'),
+    ('A', 'parse.<locals>.pairs', '437d2af775ff146249c87aed7f4418d17a154eac1a1646251feb794007aa11d7'),
+    ('A', 'parse.<locals>.constant', '210e79266c47524300ca4b784d1007959af5207ac570d57bc7dca28c43c2ce9c'),
+    ('A', 'source_oid', 'f550f0f51f20247eae5c23b083caf7f08561a7d48ad3437ba033e4508cefb49f'),
+    ('A', 'repository_identity', 'c358b10d6469aba6171f1ce7b229040c678b6feb40831bfc3faaad75bf2c0685'),
+    ('A', 'source_branch', '30bdc321bd2f6d122d98329a567be2d4434ceb4f17365ac0e0617debd2d8a739'),
+    ('A', 'validate_execution_context', '95d3317737e9a3fe586ded83840b1fd9d432d630a8510fa6d8ccdefec04c3e1a'),
+    ('A', 'validate_source', 'fb463b4811f64431a8ce246661def2e1c208530469cd58c89587a4b67d539bd0'),
+    ('C', 'prepare', '6b42e309c3bfb85cc780ccb4c3b1bf5c3f376dcb80cb08d4b618e8a40e7b14ef'),
+    ('C', 'source_checkout', '9d1f6615218a803495a36274b1cdcdd6e85ced8e9a445b6f1d58401841acf8df'),
+    ('C', 'source_identity', '79da10948efc3e64d3c997047e68754c63268eb3f7cb5360de58a70987c02d20'),
+)
+PREPARE_DIAGNOSTIC_GUARDS = (
+    ('A', 'shape', 'f7ec4707e4f0c935f97370846797f55c44db7653983a78221fea8d0606861434', 'ADMISSION_FIELDS', 'P.G.01'),
+    ('A', 'parse', '9e879d17b6bb6ecce8376c71815c39cbd51bd54d5e50a02d4a40e894ba4ba589', 'ADMISSION_SIZE', 'P.G.02'),
+    ('A', 'parse.<locals>.pairs', '6a94a3ee0f0923d97393de748791c68a7cefc16b758432eb18c478798dcba5f6', 'ADMISSION_DUPLICATE_KEY', 'P.G.03'),
+    ('A', 'parse.<locals>.constant', 'fe00cc081878eff5d8e9bf88c7e30fb1bb3e362c2df46d24b667e23d20ad24f4', 'ADMISSION_NONFINITE', 'P.G.04'),
+    ('A', 'parse', '3f41418c7aa2b530cd1fdb13cb8c6093f69da2fc6059c990e731e6ea42344813', 'ADMISSION_JSON', 'P.G.05'),
+    ('A', 'source_oid', '22b152a721437e7723066dd1a69744acb24d1d5fda799d7624f7536c1b2d6c8c', 'SOURCE_COMMIT_OID', 'P.G.06'),
+    ('A', 'repository_identity', 'bdde0a1781a0e48a1bb3042c4a1a44b6414ac657a6d5c82a02799b04ee5be889', 'SOURCE_REPOSITORY_FIELDS', 'P.G.07'),
+    ('A', 'repository_identity', 'a11d795f16ea60a61be93a94bda2bc572307c5430db3a4d2bb398d297091b6a4', 'SOURCE_REPOSITORY_OWNER', 'P.G.08'),
+    ('A', 'repository_identity', '6b9a9d11bae11790c0892fd09a9f8c88c86740ec55e8b773d001b6c8656bb5f0', 'SOURCE_REPOSITORY_IDENTITY', 'P.G.09'),
+    ('A', 'source_branch', '4724d876a85533335e66dbe67600830342f30a62a5914a221408f717899ce957', 'SOURCE_BRANCH', 'P.G.10'),
+    ('A', 'validate_execution_context', 'da9c0168d900aeee066939b3b107a0cee88d592460cd85e6c229a083469bba5a', 'CHECKOUT_EVENT_SHA', 'P.G.11'),
+    ('A', 'validate_execution_context', '7043bef210b1b27f714a7a36b883e1b3ae53d1d720a58e47710c9521293a2b73', 'SOURCE_EVENT_OBJECT', 'P.G.12'),
+    ('A', 'validate_execution_context', 'cee0748bf79b92472972639deae0757f88de94c3b47e3469b3408fd2bc8e04f0', 'SOURCE_REPOSITORY_CONTEXT', 'P.G.13'),
+    ('A', 'validate_execution_context', '49b0883f53ace410298d71acdb19cd48fa744cc7353f17dc86c45e9159efba36', 'SOURCE_PR_FIELDS', 'P.G.14'),
+    ('A', 'validate_execution_context', 'a90c9fced66a8b0b566fdfe3c38ee391a5454c90cb069d682f84368198412100', 'SOURCE_PR_NUMBER', 'P.G.15'),
+    ('A', 'validate_execution_context', 'd92bd0d3d2e974d868b418dd1ca112bd83a7726ed617046c38361069047d3583', 'SOURCE_PR_REF', 'P.G.16'),
+    ('A', 'validate_execution_context', '5fea276a729ccb7197cea6b340d32b796a152ee45411bf6ac5c57c6b768f4cd6', 'SOURCE_PR_FIELDS', 'P.G.17'),
+    ('A', 'validate_execution_context', 'a3c2a85803ef336853f7aa2877d52cef8e5ba48a192d610ea285c73e9a8c7ba3', 'SOURCE_PR_BRANCH_CONTEXT', 'P.G.18'),
+    ('A', 'validate_execution_context', '2e8265aceff8d7a07be3b62da1a4d12d3f0a9702db40acc69976dbc6637ecd7b', 'SOURCE_PR_BASE_REPOSITORY', 'P.G.19'),
+    ('A', 'validate_execution_context', '814822d7e1a8316ddd18d6b2c3ab55c7c6b85aa4a6cac8a505e1dc5c1edf335e', 'SOURCE_PR_HEAD_REPOSITORY', 'P.G.20'),
+    ('A', 'validate_execution_context', 'dec77d133d53a660a13fa5fa4b9506c5b3e68a372d418c8458046ae53c4bb833', 'SOURCE_PR_HEAD_OWNER', 'P.G.21'),
+    ('A', 'validate_execution_context', '9b9bec7632acfbdb5ef79d219006b5a150328d1183ad4cd8afd5f283d0fc96ae', 'SOURCE_PR_HEAD_REPOSITORY', 'P.G.22'),
+    ('A', 'validate_execution_context', '9323a00194dc6aed7494d327c32101fb40d8fc89da592b13560ce764f47ec808', 'SOURCE_PR_HEAD_FORK', 'P.G.23'),
+    ('A', 'validate_execution_context', '89fbdef200796b51bebed238243cdb92d2d8c52100e8f99237a30a92a4487123', 'SOURCE_PR_HEAD_USER', 'P.G.24'),
+    ('A', 'validate_execution_context', 'f4038c6464a201b2d168e4bd374903c357026971746f2c05ba7b8f40608316bd', 'SOURCE_EVENT_KIND', 'P.G.25'),
+    ('A', 'validate_execution_context', 'ae45b24dde9ec05028a0a841b307f7d05caa4f7080d4b9d849ba2f1755a3a93b', 'SOURCE_NON_PR_CONTEXT', 'P.G.26'),
+    ('A', 'validate_execution_context', 'e35004864067cfcf5533764ccc8321daa05721e869d087059898d093ffaaf266', 'SOURCE_PUSH_CONTEXT', 'P.G.27'),
+    ('A', 'validate_execution_context', '9c8e8f8b64d3d0a4f14feab09504d2774cce1aa9aaa90bd4d0b4f9697fded4ea', 'SOURCE_DISPATCH_CONTEXT', 'P.G.28'),
+    ('A', 'validate_source', '13ad0213238e9730616108488c1d469db9d71dc312c3c6b4fc02ab1caf7801bd', 'SOURCE_MISMATCH', 'P.G.29'),
+    ('A', 'validate_source', 'd11dbcd8b9c523a3309086c50b033152af97a225cface56e6402c7752d96288b', 'SOURCE_SHA', 'P.G.30'),
+    ('A', 'validate_source', '776bfe3d02d36fe9aa19101209b2199621c9a5fd04a3d6c11084e5999a5a0250', 'SOURCE_MERGE', 'P.G.31'),
+    ('A', 'validate_source', 'cf344991f1f9928868590568f1bca7205dbb8e4b7a7e4f79ab82d9a4812cae63', 'SOURCE_PR', 'P.G.32'),
+    ('A', 'validate_source', 'e79f2b3a3b0bba3862c58fab36a369c5b9cc08db4ef5cd8dd41d1e67d6d4eefd', 'SOURCE_RUN', 'P.G.33'),
+    ('A', 'validate_source', '82764f35a1c35e5be73e7ea02a65e266d686e32d228cdac2e5b9d9441b5a7d07', 'SOURCE_INPUTS', 'P.G.34'),
+    ('A', 'validate_source', '9755fc94ec975fac6dbe6bfc4ad104e53ad8baece143a4d7066412d894cc2298', 'SOURCE_HASH', 'P.G.35'),
+    ('A', 'validate_source', '836145ab13217348950fe0d5394c94b325cc812d9622f3a0f5d0de62602f9e7b', 'SOURCE_LOCK', 'P.G.36'),
+)
+PREPARE_DIAGNOSTIC_CALLERS = (
+    ('A', 'parse', 'cd97788a4359e646afd0649face0855e41938cd3738aa3e8bbb6b2e07dec9710', 'P.C.01'),
+    ('A', 'validate_execution_context', '2b059d7d9a757888aee00207f953c97b2a50cdc0416b9befbb7d5d708c2d5073', 'P.C.02'),
+    ('A', 'validate_execution_context', '338d14b6e39e07631f6e0ca030336cc8b8bfe56dd1c8698ac6a782d080a94010', 'P.C.03'),
+    ('A', 'validate_execution_context', '618d518ea89603fd7f19773aeb2160a973218ebc3d4e59c246e9aa9620eac90d', 'P.C.04'),
+    ('A', 'validate_execution_context', '94e05bdc1acf8daa2ef0e59caba4856cf368a6256e031d34eafad965d7dad18c', 'P.C.05'),
+    ('A', 'validate_execution_context', '86e5b4a96f616dc04609ae8408032d7f027dec3dd324b3fb84721b6bf90bbede', 'P.C.06'),
+    ('A', 'validate_execution_context', '194cf3b43ab1441c9deebef3a7b87eb5c1f304bce9453cbce8d83466a958fc44', 'P.C.07'),
+    ('A', 'validate_execution_context', 'd1f5508d01e1775f2e3e3edab6c71ec533ec93f03649fa7d7fa8d28788d51019', 'P.C.08'),
+    ('A', 'validate_source', 'fb24fa6f3223f7f02d3f693f40859f7390015f831421170bf77e60da6087caa2', 'P.C.09'),
+    ('C', 'source_checkout', 'c1b0d5fef8c0a3e6b621d4b5e564637c91d47234ee04788de4c1463db76b42dd', 'P.C.10'),
+    ('C', 'source_checkout', '7a212172cb3797ad008de48b33cb89f00fda846e891cc2d0638bdab602dc960d', 'P.C.11'),
+    ('C', 'source_checkout', '6d57750efc1a19ff2a12b00300615fc4336afdaf49f2f66df0d1768623cd7684', 'P.C.12'),
+    ('C', 'source_identity', '83a0fef2c48b0cc9b0ea3c06fc107de3ff15a9ca9ab96b983e2ffc2e19bf0200', 'P.C.13'),
+    ('C', 'source_identity', '39db25f7fb7fd8fccdf33031935af0456c2da354e0eeec8bb2ddb224a4d04861', 'P.C.14'),
+    ('C', 'prepare', 'd65f21b4f46d5e6b8ef2f7862649574f757cb2367d3c4f3267c6f48642bddb5d', 'P.C.15'),
+)
+
+
+def prepare_diagnostic_output(value):
+    """Independent literal vocabulary; registry data never enrolls output values."""
+    unresolved = {'schema_version': 'rg06d-prepare-admission-v1', 'phase': 'PREPARE',
+                  'guard_code': 'UNRESOLVED', 'call_sites': ['UNRESOLVED']}
+    codes = frozenset(('ADMISSION_DUPLICATE_KEY', 'ADMISSION_FIELDS', 'ADMISSION_JSON', 'ADMISSION_NONFINITE', 'ADMISSION_SIZE', 'CHECKOUT_EVENT_SHA', 'SOURCE_BRANCH', 'SOURCE_COMMIT_OID', 'SOURCE_DISPATCH_CONTEXT', 'SOURCE_EVENT_KIND', 'SOURCE_EVENT_OBJECT', 'SOURCE_HASH', 'SOURCE_INPUTS', 'SOURCE_LOCK', 'SOURCE_MERGE', 'SOURCE_MISMATCH', 'SOURCE_NON_PR_CONTEXT', 'SOURCE_PR', 'SOURCE_PR_BASE_REPOSITORY', 'SOURCE_PR_BRANCH_CONTEXT', 'SOURCE_PR_FIELDS', 'SOURCE_PR_HEAD_FORK', 'SOURCE_PR_HEAD_OWNER', 'SOURCE_PR_HEAD_REPOSITORY', 'SOURCE_PR_HEAD_USER', 'SOURCE_PR_NUMBER', 'SOURCE_PR_REF', 'SOURCE_PUSH_CONTEXT', 'SOURCE_REPOSITORY_CONTEXT', 'SOURCE_REPOSITORY_FIELDS', 'SOURCE_REPOSITORY_IDENTITY', 'SOURCE_REPOSITORY_OWNER', 'SOURCE_RUN', 'SOURCE_SHA', 'UNRESOLVED'))
+    sites = frozenset(('P.C.01', 'P.C.02', 'P.C.03', 'P.C.04', 'P.C.05', 'P.C.06', 'P.C.07', 'P.C.08', 'P.C.09', 'P.C.10', 'P.C.11', 'P.C.12', 'P.C.13', 'P.C.14', 'P.C.15', 'P.G.01', 'P.G.02', 'P.G.03', 'P.G.04', 'P.G.05', 'P.G.06', 'P.G.07', 'P.G.08', 'P.G.09', 'P.G.10', 'P.G.11', 'P.G.12', 'P.G.13', 'P.G.14', 'P.G.15', 'P.G.16', 'P.G.17', 'P.G.18', 'P.G.19', 'P.G.20', 'P.G.21', 'P.G.22', 'P.G.23', 'P.G.24', 'P.G.25', 'P.G.26', 'P.G.27', 'P.G.28', 'P.G.29', 'P.G.30', 'P.G.31', 'P.G.32', 'P.G.33', 'P.G.34', 'P.G.35', 'P.G.36', 'UNRESOLVED'))
+    if type(value) is not dict or set(value) != set(unresolved):
+        return unresolved
+    if (type(value['schema_version']) is not str or value['schema_version'] != unresolved['schema_version']
+            or type(value['phase']) is not str or value['phase'] != 'PREPARE'
+            or type(value['guard_code']) is not str or value['guard_code'] not in codes
+            or type(value['call_sites']) is not list or not 1 <= len(value['call_sites']) <= 16
+            or any(type(site) is not str or site not in sites for site in value['call_sites'])):
+        return unresolved
+    return {'schema_version': unresolved['schema_version'], 'phase': 'PREPARE',
+            'guard_code': value['guard_code'], 'call_sites': list(value['call_sites'])}
+
+
+def prepare_admission_diagnostic(error):
+    """Static attribution only: no args, locals, payload, env or path in output."""
+    unresolved = {'schema_version': 'rg06d-prepare-admission-v1', 'phase': 'PREPARE',
+                  'guard_code': 'UNRESOLVED', 'call_sites': ['UNRESOLVED']}
+    if type(error) is not admission.AdmissionError:
+        return unresolved
+    try:
+        registry = (PREPARE_DIAGNOSTIC_GUARDS, PREPARE_DIAGNOSTIC_CALLERS)
+        if (type(registry[0]) is not tuple or len(registry[0]) != 36
+                or type(registry[1]) is not tuple or len(registry[1]) != 15
+                or any(type(row) is not tuple or any(type(v) is not str or len(v) > 128 for v in row)
+                       for rows in registry for row in rows)
+                or hashlib.sha256(json.dumps(registry, separators=(',', ':'), ensure_ascii=True).encode('ascii')).hexdigest()
+                   != 'aed8c620cc4175e84a1a9a04737bf674ec7c7b35e938e51773ca73f4828febfc'):
+            return unresolved
+        models = {}
+        for label, path in (('A', Path(admission.__file__)), ('C', Path(__file__))):
+            raw = path.read_bytes()
+            if label == 'A' and hashlib.sha256(raw).hexdigest() != PREPARE_DIAGNOSTIC_ADMISSION_SHA256:
+                return unresolved
+            nodes = admission.function_nodes(admission.ast.parse(raw))
+            compiled = {c.co_qualname: c for c in admission.nested_codes(
+                compile(raw, str(path), 'exec', dont_inherit=True, optimize=0))}
+            module = admission if label == 'A' else sys.modules[__name__]
+            for owner, name, expected in PREPARE_DIAGNOSTIC_FUNCTIONS:
+                if owner != label:
+                    continue
+                top = name.split('.<locals>.', 1)[0]
+                live = next(c for c in admission.nested_codes(getattr(module, top).__code__)
+                            if c.co_qualname == name)
+                if admission.ast_fingerprint(nodes[name]) != expected or live != compiled[name]:
+                    return unresolved
+                models[id(live)] = (label, name, nodes[name])
+        traces = []
+        trace = error.__traceback__
+        while trace is not None:
+            if len(traces) == 32:
+                return unresolved
+            traces.append(trace)
+            trace = trace.tb_next
+        if not traces:
+            return unresolved
+        known = []
+        json_codes = (json.loads.__code__, json.JSONDecoder.decode.__code__,
+                      json.JSONDecoder.raw_decode.__code__)
+        for trace in reversed(traces):
+            model = models.get(id(trace.tb_frame.f_code))
+            if model is None:
+                if known and known[-1][1].startswith('parse') and trace.tb_frame.f_code in json_codes:
+                    continue
+                known.append(('?', '?', '?'))
+                break
+            label, name, node = model
+            known.append((label, name, admission.traceback_operation(trace, node)))
+            if (label, name) == ('C', 'prepare'):
+                break
+        if known and known[0][:2] == ('A', 'require'):
+            node = models[id(admission.require.__code__)][2]
+            raises = [admission.ast_fingerprint(n) for n in admission.ast.walk(node)
+                      if isinstance(n, admission.ast.Raise)]
+            if known[0][2] not in raises:
+                return unresolved
+            known = known[1:]
+        matches = [r for r in PREPARE_DIAGNOSTIC_GUARDS if known and r[:3] == known[0]]
+        if len(matches) != 1:
+            return unresolved
+        sites = [matches[0][4]]
+        for frame in known[1:]:
+            matches_call = [r[3] for r in PREPARE_DIAGNOSTIC_CALLERS if r[:3] == frame]
+            sites.append(matches_call[0] if len(matches_call) == 1 else 'UNRESOLVED')
+        if len(sites) > 16:
+            return unresolved
+        return prepare_diagnostic_output({'schema_version': 'rg06d-prepare-admission-v1', 'phase': 'PREPARE',
+                'guard_code': matches[0][3], 'call_sites': sites})
+    except Exception:
+        return unresolved
+
+
+def prepare_with_admission_diagnostics():
+    try:
+        prepare()
+    except admission.AdmissionError as error:
+        try:
+            value = prepare_diagnostic_output(prepare_admission_diagnostic(error))
+            text = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+            if len(text.encode('ascii')) <= 1024:
+                print('RG06D PREPARE DIAGNOSTIC ' + text)
+        except Exception:
+            pass  # Diagnostics must never replace the original failure.
+        raise
+
+
 def stop_process(process, receipt):
     if process is None:
         return
@@ -830,7 +1014,7 @@ if __name__ == '__main__':
     try:
         require(len(sys.argv) == 2 and sys.argv[1] in ('prepare', 'run', 'publish'), 'MODE')
         if sys.argv[1] == 'prepare':
-            prepare()
+            prepare_with_admission_diagnostics()
         elif sys.argv[1] == 'publish':
             publish()
         else:

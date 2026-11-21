@@ -2473,5 +2473,175 @@ sys.exit(code)
         a.validate_source_domain(receipt['source_identity']);self.denied(encoded(receipt))
 
 
+class PrepareAdmissionDiagnosticProposalTests(unittest.TestCase):
+    """Proposed tests only; no Docker, database, browser, or Git mutation."""
+    def context(self):
+        repo = {'id': 123, 'name': 'reqguard-quality-platform',
+                'full_name': a.OFFICIAL_REPOSITORY,
+                'owner': {'login': 'Yeromenko-Kateryna', 'id': 456}}
+        event = {'repository': repo, 'ref': 'main'}
+        env = {'GITHUB_SHA': 'b' * 40, 'GITHUB_EVENT_NAME': 'workflow_dispatch',
+               'GITHUB_REF': 'refs/heads/main', 'GITHUB_REPOSITORY': a.OFFICIAL_REPOSITORY,
+               'GITHUB_REPOSITORY_ID': '123', 'GITHUB_REPOSITORY_OWNER': 'Yeromenko-Kateryna',
+               'GITHUB_REPOSITORY_OWNER_ID': '456', 'GITHUB_HEAD_REF': '', 'GITHUB_BASE_REF': ''}
+        return event, env
+
+    def record(self, function):
+        try:
+            function()
+        except a.AdmissionError as error:
+            value = ci.prepare_admission_diagnostic(error)
+        else:
+            self.fail('Expected synthetic rejection')
+        self.assertEqual(set(value), {'schema_version', 'phase', 'guard_code', 'call_sites'})
+        self.assertEqual(value['schema_version'], 'rg06d-prepare-admission-v1')
+        self.assertEqual(value['phase'], 'PREPARE')
+        self.assertIn(value['guard_code'], {'UNRESOLVED'} | {r[3] for r in ci.PREPARE_DIAGNOSTIC_GUARDS})
+        vocabulary = {'UNRESOLVED'} | {r[4] for r in ci.PREPARE_DIAGNOSTIC_GUARDS} | {r[3] for r in ci.PREPARE_DIAGNOSTIC_CALLERS}
+        self.assertTrue(1 <= len(value['call_sites']) <= 16)
+        self.assertTrue(all(type(x) is str and x in vocabulary for x in value['call_sites']))
+        self.assertLessEqual(len(json.dumps(value, separators=(',', ':')).encode('ascii')), 1024)
+        return value
+
+    def test_pd_same_guard_code_has_distinct_caller_sites(self):
+        event, env = self.context()
+        first = self.record(lambda: a.validate_execution_context('bad-head', event, env))
+        env['GITHUB_SHA'] = 'bad-env-sha'
+        second = self.record(lambda: a.validate_execution_context('b' * 40, event, env))
+        self.assertEqual(first['guard_code'], 'SOURCE_COMMIT_OID')
+        self.assertEqual(second['guard_code'], first['guard_code'])
+        self.assertNotEqual(first['call_sites'], second['call_sites'])
+
+    def test_pd_dispatch_ref_does_not_change_admission(self):
+        event, env = self.context()
+        self.assertIsNone(a.validate_execution_context('b' * 40, event, env))
+        event['ref'] = 'refs/heads/main'  # Synthetic example, not the lost run payload.
+        value = self.record(lambda: a.validate_execution_context('b' * 40, event, env))
+        self.assertEqual(value['guard_code'], 'SOURCE_DISPATCH_CONTEXT')
+
+    def test_pd_nested_json_callbacks_and_direct_raise(self):
+        for raw, code in [(b'{"x":1,"x":2}', 'ADMISSION_DUPLICATE_KEY'),
+                          (b'{"x":NaN}', 'ADMISSION_NONFINITE'),
+                          (b'{', 'ADMISSION_JSON'), (b'', 'ADMISSION_SIZE')]:
+            with self.subTest(code=code):
+                self.assertEqual(self.record(lambda: a.parse(raw))['guard_code'], code)
+
+    def test_pd_unknown_site_and_hostile_exception_values(self):
+        class Hostile:
+            def __str__(self):
+                raise AssertionError('Exception payload must not be rendered')
+            __repr__ = __str__
+        def foreign():
+            raise a.AdmissionError(Hostile())
+        value = self.record(foreign)
+        self.assertEqual(value['guard_code'], 'UNRESOLVED')
+        self.assertEqual(value['call_sites'], ['UNRESOLVED'])
+        class ForeignAdmission(a.AdmissionError):
+            pass
+        self.assertEqual(ci.prepare_admission_diagnostic(ForeignAdmission(Hostile())), value)
+
+    def test_pd_payload_environment_and_private_path_not_serialized(self):
+        marker = 'CONTROLLED_SECRET_PRIVATE_PATH'
+        event, env = self.context()
+        event['ref'] = marker
+        env['GITHUB_REF'] = marker
+        with patch.dict(os.environ, {'PROPOSAL_SECRET': marker}):
+            value = self.record(lambda: a.validate_execution_context('b' * 40, event, env))
+        self.assertEqual(value['guard_code'], 'SOURCE_DISPATCH_CONTEXT')
+        self.assertNotIn(marker, json.dumps(value))
+        self.assertNotIn(__file__, json.dumps(value))
+
+    def test_pd_source_or_live_code_drift_is_unresolved(self):
+        for target in ('source', 'live'):
+            with self.subTest(target=target):
+                manager = (patch.object(ci, 'PREPARE_DIAGNOSTIC_ADMISSION_SHA256', '0' * 64)
+                           if target == 'source' else patch.object(a, 'source_oid', lambda value: value))
+                with manager:
+                    value = self.record(lambda: a.parse(b''))
+                self.assertEqual(value['guard_code'], 'UNRESOLVED')
+
+    def test_pd_wrapper_preserves_original_and_does_not_read_args(self):
+        error = a.AdmissionError('CONTROLLED_SECRET')
+        for diagnostic_failure in (False, True):
+            with self.subTest(diagnostic_failure=diagnostic_failure):
+                buffer = io.StringIO()
+                with patch.object(ci, 'prepare', side_effect=error), patch.object(sys, 'stdout', buffer):
+                    manager = (patch.object(ci, 'prepare_admission_diagnostic', side_effect=OSError('CONTROLLED_SECRET'))
+                               if diagnostic_failure else ExitStack())
+                    with manager, self.assertRaises(a.AdmissionError) as caught:
+                        ci.prepare_with_admission_diagnostics()
+                self.assertIs(caught.exception, error)
+                self.assertNotIn('CONTROLLED_SECRET', buffer.getvalue())
+
+    def test_pd_success_emits_nothing(self):
+        buffer = io.StringIO()
+        with patch.object(ci, 'prepare') as prepare, patch.object(sys, 'stdout', buffer):
+            ci.prepare_with_admission_diagnostics()
+        prepare.assert_called_once_with()
+        self.assertEqual(buffer.getvalue(), '')
+
+    def test_pd_outer_main_keeps_exit_one(self):
+        # Execute only the existing main AST under controlled globals; never import as CLI.
+        tree = ast.parse(Path(ci.__file__).read_bytes())
+        main = next(n for n in tree.body if isinstance(n, ast.If)
+                    and ast.unparse(n.test) == "__name__ == '__main__'")
+        namespace = dict(vars(ci), __name__='__main__')
+        buffer = io.StringIO()
+        error = a.AdmissionError('CONTROLLED_SECRET')
+        with patch.object(ci, 'prepare', side_effect=error), patch.object(sys, 'stdout', buffer), \
+             patch.object(sys, 'argv', ['synthetic', 'prepare']):
+            with self.assertRaises(SystemExit) as caught:
+                exec(compile(ast.Module(body=[main], type_ignores=[]), '<synthetic-main>', 'exec'), namespace)
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn('RG06D STOP: AdmissionError', buffer.getvalue())
+        self.assertNotIn('CONTROLLED_SECRET', buffer.getvalue())
+
+
+    def test_pd_registry_code_correction(self):
+        original = ci.PREPARE_DIAGNOSTIC_GUARDS
+        allowed = {r[3] for r in original} | {'UNRESOLVED'}
+        corrupt = tuple(r[:3] + ('CONTROLLED_SECRET_CODE', r[4]) if r[3] == 'ADMISSION_SIZE' else r for r in original)
+        with patch.object(ci, 'PREPARE_DIAGNOSTIC_GUARDS', corrupt):
+            value = self.record(lambda: a.parse(b''))
+        self.assertIn(value['guard_code'], allowed)
+        self.assertEqual(value['guard_code'], 'UNRESOLVED')
+
+    def test_pd_registry_site_correction(self):
+        original = ci.PREPARE_DIAGNOSTIC_GUARDS
+        corrupt = tuple(r[:4] + ('CONTROLLED_SECRET_SITE',) if r[3] == 'ADMISSION_SIZE' else r for r in original)
+        with patch.object(ci, 'PREPARE_DIAGNOSTIC_GUARDS', corrupt):
+            value = self.record(lambda: a.parse(b''))
+        self.assertEqual(value['call_sites'], ['UNRESOLVED'])
+
+    def test_pd_known_vocabulary_substitution_is_unresolved(self):
+        original = ci.PREPARE_DIAGNOSTIC_GUARDS
+        corrupt = tuple(r[:3] + ('ADMISSION_JSON', r[4]) if r[3] == 'ADMISSION_SIZE' else r for r in original)
+        with patch.object(ci, 'PREPARE_DIAGNOSTIC_GUARDS', corrupt):
+            value = self.record(lambda: a.parse(b''))
+        self.assertEqual(value['guard_code'], 'UNRESOLVED')
+
+    def test_pd_independent_output_boundary(self):
+        valid = {'schema_version': 'rg06d-prepare-admission-v1', 'phase': 'PREPARE',
+                 'guard_code': 'UNRESOLVED', 'call_sites': ['UNRESOLVED']}
+        for key, bad in [('guard_code', 'CONTROLLED_SECRET_CODE'),
+                         ('call_sites', ['CONTROLLED_SECRET_SITE']), ('phase', 'CONTROLLED_SECRET_PHASE'),
+                         ('schema_version', 'CONTROLLED_SECRET_SCHEMA'), ('call_sites', ['UNRESOLVED'] * 17)]:
+            injected = {**valid, key: bad}
+            with self.subTest(key=key, value=bad):
+                self.assertEqual(ci.prepare_diagnostic_output(injected), valid)
+                error = a.AdmissionError('CONTROLLED_SECRET_ERROR')
+                output = io.StringIO()
+                with patch.object(ci, 'prepare', side_effect=error), \
+                     patch.object(ci, 'prepare_admission_diagnostic', return_value=injected), \
+                     patch.object(sys, 'stdout', output):
+                    with self.assertRaises(a.AdmissionError) as caught:
+                        ci.prepare_with_admission_diagnostics()
+                self.assertIs(caught.exception, error)
+                self.assertEqual(len(output.getvalue().splitlines()), 1)
+                self.assertNotIn('CONTROLLED_SECRET', output.getvalue())
+                value = json.loads(output.getvalue().split('RG06D PREPARE DIAGNOSTIC ', 1)[1])
+                self.assertEqual(value, valid)
+
+
 if __name__ == '__main__':
     unittest.main()
