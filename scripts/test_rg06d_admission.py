@@ -204,6 +204,7 @@ class EvidenceTests(unittest.TestCase):
         # publisher/copy/validator path with synthetic admission receipts only.
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp); raw = directory / RUN; raw.mkdir(); bundle(raw)
+            a.write(raw, 'results.json', publication_report_fixture())
             for name in ci.JSON_ALLOWLIST:
                 if not (raw / name).exists(): a.write(raw, name, {})
             for name in ci.LOG_ALLOWLIST: (raw / name).write_text('synthetic diagnostic\n')
@@ -2641,6 +2642,67 @@ class PrepareAdmissionDiagnosticProposalTests(unittest.TestCase):
                 self.assertNotIn('CONTROLLED_SECRET', output.getvalue())
                 value = json.loads(output.getvalue().split('RG06D PREPARE DIAGNOSTIC ', 1)[1])
                 self.assertEqual(value, valid)
+
+
+def publication_report_fixture():
+    return {'config': {'projects': [], 'metadata': {'gitCommit': {'hash': SOURCE['checkout_sha']}}},
+            'suites': [{'specs': [{'title': 'synthetic publication fixture',
+                                 'tests': [{'results': [{'status': 'passed'}]}]}]}],
+            'errors': [], 'stats': {'expected': 1, 'unexpected': 0, 'skipped': 0}}
+
+
+class PublicationFixtureCorrectionTests(unittest.TestCase):
+    def test_pf_valid_report_preserves_results_and_sha(self):
+        report = publication_report_fixture()
+        safe = json.loads(ci.sanitize_playwright_results(encoded(report), SOURCE['checkout_sha']))
+        self.assertEqual(safe, report)
+
+    def test_pf_empty_report_remains_rejected(self):
+        with self.assertRaisesRegex(ci.Stop, '^PUBLIC_RESULTS_SHAPE$'):
+            ci.sanitize_playwright_results(b'{}', SOURCE['checkout_sha'])
+
+    def test_pf_unknown_identity_location_remains_rejected(self):
+        report = publication_report_fixture()
+        report['suites'][0]['gitCommit'] = {'hash': SOURCE['checkout_sha']}
+        with self.assertRaisesRegex(ci.Stop, '^UNEXPECTED_GIT_METADATA$'):
+            ci.sanitize_playwright_results(encoded(report), SOURCE['checkout_sha'])
+
+    def test_pf_malformed_report_remains_rejected(self):
+        with self.assertRaisesRegex(ci.Stop, '^EVIDENCE_JSON_INVALID$'):
+            ci.sanitize_playwright_results(b'{', SOURCE['checkout_sha'])
+
+    def test_pf_publication_rejects_invalid_reports_without_success(self):
+        unknown = publication_report_fixture()
+        unknown['suites'][0]['gitCommit'] = {'hash': SOURCE['checkout_sha']}
+        for bad in (b'{}', b'{', encoded(unknown)):
+            with self.subTest(raw=bad), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp); raw = directory / RUN; raw.mkdir(); bundle(raw)
+                for name in ci.JSON_ALLOWLIST:
+                    if not (raw / name).exists(): a.write(raw, name, {})
+                (raw / 'results.json').write_bytes(bad)
+                for name in ci.LOG_ALLOWLIST: (raw / name).write_text('synthetic diagnostic\n')
+                admission_bytes = {name: (raw / name).read_bytes() for name in ci.ADMISSION_FILES}
+                env = {**ENV, 'RUNNER_TEMP': temp, 'RG06D_RUN_OUTCOME': 'success'}
+                output = io.StringIO()
+                # Same legacy SQL/source seams as the original test; sanitizer,
+                # admission-bundle validation, file copying and final gate are real.
+                with patch.dict('os.environ', env), patch.object(ci, 'artifact', return_value=raw), \
+                     patch.object(ci, 'validate_launch', return_value=SOURCE), \
+                     patch.object(ci, 'validate_unsupported_receipts'), \
+                     patch.object(sys, 'stdout', output), \
+                     self.assertRaisesRegex(ci.Stop, '^EVIDENCE_PUBLICATION_INCOMPLETE$'):
+                    ci.publish()
+                safe = directory / 'rg06d-safe-123-1'
+                manifest = a.parse(a.read(safe, 'publication-manifest.json'))
+                self.assertEqual((raw / 'results.json').read_bytes(), bad)
+                self.assertIn('results.json', manifest['rejected'])
+                self.assertNotIn('results.json', manifest['copied'])
+                self.assertFalse((safe / 'results.json').exists())
+                self.assertNotIn('sanitized', manifest)
+                self.assertNotIn('safe evidence prepared', output.getvalue())
+                with patch.dict('os.environ', ENV): ci.validate_admission_bundle(safe, SOURCE, RUN)
+                for name, value in admission_bytes.items():
+                    self.assertEqual((safe / name).read_bytes(), value)
 
 
 class ArtifactPrivacyProposalTests(unittest.TestCase):
