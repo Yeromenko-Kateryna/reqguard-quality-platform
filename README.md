@@ -1,6 +1,4 @@
-# ReqGuard Quality Platform
-
-**Portfolio v1.0 — QA Automation / SDET: browser → API → PostgreSQL → CI.**
+# ReqGuard — QA Automation / SDET Portfolio
 
 ReqGuard demonstrates verification across system boundaries: submit a requirement
 in a browser, receive an authored analysis, and trace the response to a committed
@@ -8,16 +6,22 @@ database row by `run_id`. The product uses a **deterministic fake provider** wit
 no live model calls. The separate offline AI Quality component verifies evaluation
 mechanics; its passing tests do **not** prove live-model semantic quality.
 
-**Documentation provenance (2026-11-01).** This guide was updated from accepted merge
-[`ca03b640bfaa5c8691efda620e993ed5a38242db`](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/commit/ca03b640bfaa5c8691efda620e993ed5a38242db);
-the revision containing this updated guide must be independently reviewed
-and identified through the public revision record required in step 0.
-The earlier RG-STATE-01 / 2026-10-27 guide described
-[`3b04823484222c1063d3f58f428535198c8be10e`](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/commit/3b04823484222c1063d3f58f428535198c8be10e).
-RG-README-02 was a pre-publication review label, not a setup dependency.
-“Portfolio v1.0” labels the portfolio scope; application/package metadata remains
-`0.1.0`. **Portfolio V1.0 is not yet declared released.** Use only the runtime
-inputs and tracked README of the immutable revision admitted in step 0.
+Inspect the [requirements, risks and accepted test evidence](docs/portfolio/TRACEABILITY_MATRIX.md) or the [execution evidence index](docs/portfolio/EVIDENCE_INDEX.md) for source-bound historical CI results and platform/release limitations.
+
+---
+
+## Tech Stack
+
+- Python and FastAPI / Pydantic for the product API
+- PostgreSQL and Psycopg for persistence
+- HTML, CSS and JavaScript modules for the UI
+- TypeScript and Playwright for Chromium / HTTP / SQL checks
+- Node.js for frontend DOM-adapter contract tests
+- pytest for Python contracts and offline evaluation
+- Docker Compose for the documented service setup
+- GitHub Actions for hosted automation
+
+---
 
 ## Architecture and published behavior
 
@@ -53,7 +57,154 @@ unsupported payloads use **SQL NULL**, not JSON literal `null`. Constraints enfo
 status/payload consistency. A candidate test is authored output, not an executed
 password-reset test.
 
-Inspect the [requirements, risks and accepted test evidence](docs/portfolio/TRACEABILITY_MATRIX.md) or the [execution evidence index](docs/portfolio/EVIDENCE_INDEX.md) for source-bound historical CI results and platform/release limitations.
+---
+
+## QA Automation Coverage
+
+### Browser, HTTP and PostgreSQL
+
+The [Chromium scenarios](quality/browser/analyses.spec.ts) cover:
+
+- the supported requirement: visible completed result and an independently read committed SQL row;
+- invalid whitespace: an actual HTTP 422 response and unchanged SQL data;
+- other valid input: visible `unsupported_fixture` result and SQL NULL analysis;
+- response / row correlation by `run_id`, preserved input, sentinel checks and owned cleanup receipts.
+
+The provider is deterministic and the authored test scenario is output, not an
+executed password-reset feature. Coverage is Chromium only; Firefox and WebKit
+results are not claimed.
+
+### Frontend and Python Contracts
+
+- [Frontend contracts](tests/ui.test.mjs) check loading, stale state, readable validation errors, uncertain network outcomes, no automatic retries and text-node rendering.
+- These DOM-adapter checks are separate from real-browser E2E.
+- [API contracts](tests/test_analyses.py), [persistence unit tests](tests/test_persistence_unit.py) and [UI HTTP tests](tests/test_ui.py) provide additional Python test coverage. Source presence does not prove a fresh execution of every suite.
+- [Real-DB tests](tests/test_postgres_integration.py) and the [network/SQL smoke](scripts/rg04_network_sql_smoke.py) remain separate procedures with their existing ownership and execution restrictions.
+
+### Deterministic AI Quality
+
+The separate offline evaluator tests synthetic dataset loading, hard-fail rules,
+metrics, evidence integrity and fake execution. It does not measure the reasoning
+or semantic quality of a live model. See [AI Quality: what is established](#ai-quality-what-is-established)
+and the [evidence index](docs/portfolio/EVIDENCE_INDEX.md#p03).
+
+---
+
+## Quality Practices Demonstrated
+
+- Requirements and risks mapped to identifiable tests and execution evidence
+- Positive, invalid and unsupported-input scenarios with distinct assertions
+- Real HTTP checks combined with independent committed-data verification
+- Test-data ownership checks, sentinel preservation and targeted cleanup evidence
+- Explicit separation of browser E2E, DOM contracts and Python unit seams
+- Source-bound CI runs, receipt checksums and documented evidence custody
+- Scoped privacy checks and honest handling of missing or inaccessible evidence
+
+These practices do not establish complete RG-05 isolation, universal privacy
+protection or production readiness.
+
+---
+
+## Actual Execution Evidence
+
+Accepted post-merge GitHub Actions results on **2026-11-22**, all `push(main)`,
+attempt 1, at **`9606662a5e7c895d792794a43bf349f1d426446c`**:
+
+| Workflow | Execution | Recorded conclusion |
+|---|---|---|
+| Chromium → FastAPI → PostgreSQL | [RG-06D 45019571841](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/45019571841) | completed / success |
+| Frontend DOM-adapter contracts | [Frontend 45019571836](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/45019571836) | completed / success |
+| Deterministic offline evaluator | [Offline 45019571833](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/actions/runs/45019571833) | completed / success |
+
+These are executions of that immutable merged revision, **not of this uncommitted
+README presentation candidate**. No test or CI run was performed for this edit.
+Successful workflow status is separate from detailed receipt inspection.
+
+For an evidence walkthrough, follow the [traceability matrix](docs/portfolio/TRACEABILITY_MATRIX.md)
+to [P01 browser/HTTP/SQL receipts](docs/portfolio/EVIDENCE_INDEX.md#p01),
+[P02 frontend JUnit](docs/portfolio/EVIDENCE_INDEX.md#p02) and
+[P03 offline logs](docs/portfolio/EVIDENCE_INDEX.md#p03).
+Those detailed accepted post-merge records retain their original
+**`4640729a9662ef76922f6b22243edb41db65d486`** execution identities; historical D1
+records retain their older revisions. They are not relabelled as new run payloads.
+
+Artifacts can expire or require GitHub authentication. The index identifies
+owner-retained originals without promising private handoffs in a public clone.
+Known Playwright Git-metadata sanitization is not universal PII detection; raw
+pre-sanitization report bytes remain unavailable. Qualified Windows R2.3 manual
+evidence is separate from Ubuntu CI and the main README reproduction route.
+
+---
+
+## Project Status
+
+- `EMPLOYER_READINESS = READY_WITH_EXPLICIT_LIMITATIONS`
+- `FORMAL_RELEASE = NOT_AUTHORIZED`
+
+Suitable for a bounded **code-and-CI portfolio walkthrough**, with the evidence and
+limitations above. This is not a fully released production system or a fresh
+Windows runtime demonstration.
+
+Existing restrictions remain:
+
+- `RG05 = BLOCKED`
+- `G05 = DEFERRED BY OWNER / NOT SATISFIED`
+- `PRELAUNCH_DECISION = REFUSE`
+- `STAGE_B = NOT_AUTHORIZED`
+- `RELEASE = NOT_AUTHORIZED`
+- `WINDOWS_README_LITERAL_REPRODUCTION = BLOCKED`
+- `RUNTIME_SAFETY_D_TO_J = OPEN`
+- `PUBLIC_REVIEW_RECORD = UNRESOLVED`
+
+Linux CI and portfolio documentation do not satisfy these gates. The separate
+qualified Windows demo does not verify literal reproduction of this guide.
+The private Docker-config proposal is not adopted or implemented. Do not infer
+permission to provision, launch, clean up resources or release the project.
+
+---
+
+## Repository Structure
+
+```text
+.github/workflows/          # Chromium, frontend and offline evaluator workflows
+reqguard/                  # FastAPI product and Python evaluator
+  static/                  # Browser UI
+  evaluation/              # Deterministic offline evaluation
+quality/browser/           # Playwright / independent PostgreSQL assertions
+tests/                     # Python tests and frontend DOM contracts
+db/001_init.sql            # PostgreSQL schema
+scripts/                   # Source-bound verification / evidence harnesses
+docs/portfolio/            # Requirements, risks and evidence navigation
+docs/ai-quality/           # Offline evaluation contracts and historical evidence
+compose.yaml               # Existing local service configuration
+```
+
+The diagram describes tracked content, not permission to run every procedure.
+Local RG-05 orchestration and retained private evidence are not clone prerequisites;
+see [published scope and historical evidence](#published-scope-local-rg-05-work-and-historical-evidence).
+
+---
+
+## Documentation Provenance
+
+The preserved provenance below describes earlier guide revisions. The current
+presentation candidate is based on merged `9606662a5e7c895d792794a43bf349f1d426446c`.
+Its own future public-review identity is not yet established. The reproduction
+procedure below remains unchanged in order, commands, versions and STOP conditions;
+this editorial restructuring does not grant execution approval.
+
+**Documentation provenance (2026-11-01).** This guide was updated from accepted merge
+[`ca03b640bfaa5c8691efda620e993ed5a38242db`](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/commit/ca03b640bfaa5c8691efda620e993ed5a38242db);
+the revision containing this updated guide must be independently reviewed
+and identified through the public revision record required in step 0.
+The earlier RG-STATE-01 / 2026-10-27 guide described
+[`3b04823484222c1063d3f58f428535198c8be10e`](https://github.com/Yeromenko-Kateryna/reqguard-quality-platform/commit/3b04823484222c1063d3f58f428535198c8be10e).
+RG-README-02 was a pre-publication review label, not a setup dependency.
+“Portfolio v1.0” labels the portfolio scope; application/package metadata remains
+`0.1.0`. **Portfolio V1.0 is not yet declared released.** Use only the runtime
+inputs and tracked README of the immutable revision admitted in step 0.
+
+---
 
 ## Reproduce the browser-to-database demo
 
@@ -381,6 +532,8 @@ Do not stop PostgreSQL before DB-dependent integration/smoke checks finish.
 If request/COMMIT outcome is uncertain or UUID is missing, inspect before retrying:
 a failure does not prove row absence. Shutdown instructions follow the checks.
 
+---
+
 ## Run the checks
 
 ### Product and frontend
@@ -563,7 +716,11 @@ measured live-provider latency. Authoritative per-job selectors and strict JUnit
 gates are in the workflow below. Offline tests need no AI API, DB or Docker;
 environment bootstrap may need downloads.
 
+---
+
 ## Coverage and GitHub Actions evidence
+
+The records below retain their original dates, source revisions and execution limits. For accepted post-merge results at the current presentation baseline, see [Actual Execution Evidence](#actual-execution-evidence).
 
 PORT-01 local validation on 2026-10-25: the three product modules listed above
 returned **28 passed, 1 Starlette/httpx deprecation warning** under the existing
@@ -582,7 +739,7 @@ RG-README-02 revision; no Docker command was executed for the correction.
 | --- | --- | --- |
 | API contract | [test_analyses.py](tests/test_analyses.py) | Fixture, distinct UUIDs, validation, unsupported input, OpenAPI; persistence stub. |
 | Persistence unit | [test_persistence_unit.py](tests/test_persistence_unit.py) | Mapping, binding, COMMIT boundary, sanitized failures/no retries; no real DB. |
-| UI HTTP / frontend | [test_ui.py](tests/test_ui.py), [ui.test.mjs](tests/ui.test.mjs) | Routes/assets, API mapping, request/state/errors, text rendering; stubs/DOM adapter. Not standalone suites in current workflows. |
+| UI HTTP / frontend | [test_ui.py](tests/test_ui.py), [ui.test.mjs](tests/ui.test.mjs) | Routes/assets and API mapping use Python test seams. Frontend request/state/errors and text rendering use a DOM adapter with a [standalone workflow](.github/workflows/rg-ui-contracts.yml); Python UI HTTP tests remain separate. |
 | Real DB / smoke | [test_postgres_integration.py](tests/test_postgres_integration.py), [smoke](scripts/rg04_network_sql_smoke.py) | Committed reads, exact schema, constraints, rollback, SQL NULL and targeted cleanup. Not standalone Actions jobs. |
 | Browser E2E | [analyses.spec.ts](quality/browser/analyses.spec.ts), [CI harness](scripts/run_rg06d_ci.py), [workflow](.github/workflows/rg06d-e2e.yml) | Three Chromium scenarios: supported, invalid whitespace and unsupported; real UI/HTTP/SQL, SQL NULL, preserved input, sentinel and cleanup receipts. |
 | Offline rules / metrics | [dataset](tests/test_evaluation_dataset.py), [hard-fail](tests/test_evaluation_hard_fail.py), [metrics](tests/test_evaluation_metrics.py) | 297 expected cases; synthetic data, mechanical rules, aggregation and incomplete-evidence gates. |
@@ -647,6 +804,8 @@ later inspection, without changing the dated run conclusion. GitHub service
 disposal is outside harness attestation; inspect job cleanup logs separately.
 Hard cancellation/runner loss can interrupt receipts and publication.
 
+---
+
 ## AI Quality: what is established
 
 The [evaluation specification](docs/ai-quality/RG-07A_EVALUATION_SPEC_v1.md) and
@@ -664,6 +823,8 @@ or completeness, authentic human annotations, comprehensive Unicode conformance 
 production AI safety. Missing assessment/provenance must not become a passing
 quality verdict. The offline fake provider is distinct from the product's single
 authored fixture. No model key or paid call is needed.
+
+---
 
 ## Published scope, local RG-05 work and historical evidence
 
@@ -704,3 +865,11 @@ Preserved historical references:
 Authentication, production deployment, live-model semantic evaluation and a complete
 RG-05 lifecycle are not demonstrated. k6, axe-core and ZAP belong to a separate
 future project. Old AI QA Assistant results are not ReqGuard evidence.
+
+---
+
+## Author
+
+Kateryna Yeromenko
+
+GitHub: [Yeromenko-Kateryna](https://github.com/Yeromenko-Kateryna)
