@@ -53,6 +53,8 @@ unsupported payloads use **SQL NULL**, not JSON literal `null`. Constraints enfo
 status/payload consistency. A candidate test is authored output, not an executed
 password-reset test.
 
+Inspect the [requirements, risks and accepted test evidence](docs/portfolio/TRACEABILITY_MATRIX.md) or the [execution evidence index](docs/portfolio/EVIDENCE_INDEX.md) for source-bound historical CI results and platform/release limitations.
+
 ## Reproduce the browser-to-database demo
 
 Commands use **Windows PowerShell 5.1 or PowerShell 7**, on Windows x64, from the
